@@ -1,0 +1,46 @@
+name: Truecount mutation check
+description: Break each changed line of a pull request on purpose, run your tests, and report the breaks they missed.
+author: Truecount
+branding:
+  icon: check-square
+  color: green
+
+inputs:
+  test-command:
+    description: Runs your tests and exits non-zero when one fails, e.g. "python -m pytest -x -q". Fast-failing flags make the check much quicker.
+    required: true
+  base:
+    description: The commit the change is measured against. Needs a checkout with fetch-depth 0.
+    default: ${{ github.event.pull_request.base.sha }}
+  max-mutants:
+    description: The most breaks to run. Each one runs your test command once.
+    default: "40"
+  python:
+    description: A Python 3.10+ interpreter. The check itself uses only the standard library.
+    default: python3
+
+runs:
+  using: composite
+  steps:
+    - name: Run the mutation check
+      shell: bash
+      env:
+        TC_BASE: ${{ inputs.base }}
+        TC_MAX: ${{ inputs.max-mutants }}
+        TC_PYTHON: ${{ inputs.python }}
+        TC_TESTS: ${{ inputs.test-command }}
+        TC_SCRIPT: ${{ github.action_path }}/src/truecount_action/mutate.py
+      # Inputs arrive as environment variables, never pasted into the script,
+      # so a value cannot inject shell. A failing baseline is a result, not an
+      # error: it is in the report, which Truecount posts. Only a missing
+      # report fails the job, in the upload step.
+      run: |
+        "$TC_PYTHON" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" \
+          --json truecount-mutation.json --markdown "$GITHUB_STEP_SUMMARY" \
+          -- bash -c "$TC_TESTS" || true
+    - uses: actions/upload-artifact@v7
+      with:
+        name: truecount-mutation
+        path: truecount-mutation.json
+        if-no-files-found: error
+        retention-days: 7
