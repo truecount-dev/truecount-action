@@ -67,9 +67,9 @@ def test_test_files_are_never_mutated():
 def test_breaks_offered_on_each_line():
     mutants = mutate.generate("m.py", SAMPLE, set(range(1, 20)))
     assert ops(mutants, 4) == ["0 → 1"]  # the default value; the 1 inside the annotation is skipped
-    assert ops(mutants, 6) == ["negate condition", "negate == → !="]
+    assert ops(mutants, 6) == ["condition → False", "condition → True", "negate == → !="]
     assert ops(mutants, 8) == ["return None", "True → False"]
-    assert ops(mutants, 9) == ["negate condition", "remove not"]
+    assert ops(mutants, 9) == ["condition → False", "condition → True", "remove not"]
     assert ops(mutants, 10) == ["remove raise"]
     assert ops(mutants, 11) == ["+ → -", "1 → 2"]
     assert ops(mutants, 12) == ["remove call"]
@@ -192,8 +192,11 @@ def test_end_to_end_finds_the_untested_branch_and_restores_every_file(project):
     report = mutate.run("HEAD~1", "HEAD", command, project, limit=100)
     status = {(m.line, m.operator): m.status for m in report.mutants}
 
-    # Nothing calls clamp() above `high`, so breaking that branch goes unnoticed.
+    # Nothing calls clamp() above `high`, so breaking that branch goes
+    # unnoticed, and so does removing its guard altogether.
     assert status[(5, "return None")] == "survived"
+    assert status[(4, "condition → False")] == "survived"
+    assert status[(4, "condition → True")] == "killed"
     assert status[(2, "negate < → >=")] == "killed"
     assert status[(3, "return None")] == "killed"
     # Same length as the original: only caught if no stale bytecode is reused.
@@ -206,12 +209,13 @@ def test_end_to_end_finds_the_untested_branch_and_restores_every_file(project):
     git(project, "diff", "--exit-code")
 
     markdown = report.to_markdown()
-    assert "The tests caught **7 of 10** deliberate breaks" in markdown
+    assert "The tests caught **8 of 12** deliberate breaks" in markdown
     # Sorted by line. The two boundary survivors are equivalent mutants: at
     # n == low, returning low and returning n are the same value. The report
     # says a survivor is a lead, not proof, for exactly this reason.
     assert markdown.split("**Not caught**")[1].split("Each of these")[0].strip().splitlines() == [
         "- `calc.py:2` `n < low` → `n <= low` (boundary < → <=)",
+        "- `calc.py:4` `if n > high:` → `if False:` (condition → False)",
         "- `calc.py:4` `n > high` → `n >= high` (boundary > → >=)",
         "- `calc.py:5` `return high` → `return None` (return None)",
     ]

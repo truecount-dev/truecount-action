@@ -1,6 +1,6 @@
 """Diff-scoped mutation testing, with no model in the loop: Python on the
-standard library's `ast`, and JavaScript, TypeScript, Go and Ruby through
-tree-sitter (languages.py).
+standard library's `ast`, SQL in Python strings (sql.py), and JavaScript,
+TypeScript, Go and Ruby through tree-sitter (languages.py).
 
 For each line a change touched, make one small deliberate break, run the
 tests, and record whether they noticed. A break the tests miss has
@@ -39,9 +39,10 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 try:
-    from . import languages
+    from . import languages, sql
 except ImportError:  # run as a plain script by the Action: python mutate.py
     import languages  # type: ignore[no-redef]
+    import sql  # type: ignore[no-redef]
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 DEFAULT_MAX = 40
@@ -232,7 +233,15 @@ def _breaks(node: ast.AST) -> list[tuple[str, ast.AST]]:
         out.append((f"{node.value} → {not node.value}", ast.Constant(not node.value)))
     elif isinstance(node, ast.Constant) and type(node.value) is int:
         out.append((f"{node.value} → {node.value + 1}", ast.Constant(node.value + 1)))
-    elif isinstance(node, (ast.If, ast.While)):
+    elif isinstance(node, ast.If):
+        # Never taken (the guard is gone), then always taken. Between them they
+        # catch everything negating the condition would, and more: a negated
+        # condition survives only when both of these do.
+        for value in (False, True):
+            new = copy.copy(node)
+            new.test = ast.Constant(value)
+            out.append((f"condition → {value}", new))
+    elif isinstance(node, ast.While):  # always true would hang, so a while is negated
         new = copy.copy(node)
         new.test = ast.UnaryOp(op=ast.Not(), operand=node.test)
         out.append(("negate condition", new))
@@ -271,13 +280,13 @@ def generate(path: str, source: str, lines: set[int]) -> list[Mutant]:
             mutants.append(
                 Mutant(path, node.lineno, operator, _describe(node), _describe(replacement), index, source)
             )
-    return mutants
+    return mutants + sql.generate(path, source, lines, Mutant)
 
 
 def build(mutant: Mutant) -> str | None:
     """The whole module with this one break applied, or None if it will not compile."""
     if mutant.start_byte >= 0:
-        return languages.build(mutant)
+        return sql.build(mutant) if mutant.path.endswith(".py") else languages.build(mutant)
     tree = ast.parse(mutant.module)
     target = list(ast.walk(tree))[mutant.node_index]
     replacement = dict(_breaks(target))[mutant.operator]

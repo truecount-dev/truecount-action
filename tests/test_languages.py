@@ -28,7 +28,8 @@ def offered(path, source, lines):
 def test_javascript_offers_the_python_engines_breaks_on_changed_lines_only():
     got = offered("src/price.js", JS, {2, 3, 6})
     assert (2, "negate > → <=") in got and (2, "boundary > → >=") in got
-    assert (2, "&& → ||") in got and (2, "remove not") in got and (2, "negate condition") in got
+    assert (2, "&& → ||") in got and (2, "remove not") in got
+    assert (2, "condition → false") in got and (2, "condition → true") in got
     assert (3, "* → /") in got and (3, "2 → 3") in got
     assert (6, "+ → -") in got
     assert {line for line, _ in got} == {2, 3, 6}
@@ -46,7 +47,11 @@ def test_logging_template_strings_and_types_are_left_alone():
 def test_go_and_ruby_breaks():
     go = "package p\n\nfunc f(a, b int) bool {\n\tif a >= b && !ok() {\n\t\treturn a+1 > b\n\t}\n\treturn true\n}\n"
     got = offered("p/f.go", go, {4, 5, 7})
-    assert (4, "negate >= → <") in got and (4, "negate condition") in got and (5, "+ → -") in got and (7, "true → false") in got
+    assert (4, "negate >= → <") in got and (4, "condition → false") in got and (5, "+ → -") in got and (7, "true → false") in got
+    # With an initializer, a constant condition would leave err unused, which does not compile.
+    init = "package p\n\nfunc g() error {\n\tif err := f(); err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n"
+    got = offered("p/g.go", init, {4})
+    assert (4, "negate condition") in got and not any(op.startswith("condition →") for _, op in got)
     rb = "def f(a, b)\n  return a + 1 if a == b and !c\n  a < b || false\nend\n"
     got = offered("lib/f.rb", rb, {2, 3})
     assert (2, "negate == → !=") in got and (2, "and → or") in got and (3, "|| → &&") in got
@@ -58,6 +63,8 @@ def test_a_break_is_a_byte_edit_and_one_that_stops_parsing_is_unbuildable():
     assert built == JS.replace("return qty + 1;", "return qty - 1;")
     m.replacement = "+ +("  # something that does not parse
     assert mutate.build(m) is None
+    guard = next(m for m in languages.generate("src/price.js", JS, {2}, mutate.Mutant) if m.operator == "condition → false")
+    assert mutate.build(guard) == JS.replace("if (qty > 10 && !member)", "if (false)")
 
 
 def test_without_the_parser_the_files_are_skipped_and_python_still_runs(monkeypatch):

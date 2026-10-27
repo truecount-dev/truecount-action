@@ -8,9 +8,10 @@ Today that is the mutation check.
 ## Mutation check
 
 For each line a pull request changes, the check makes one small deliberate
-break: a flipped comparison, an off-by-one boundary, a removed `raise`, a
-`return None`. It runs your tests once per break and reports the ones they
-missed.
+break: a flipped comparison, an off-by-one boundary, an `if` whose condition
+never holds, a removed `raise`, a `return None`. In SQL written as Python
+strings it swaps `ASC` and `DESC`, moves a boundary, or drops one `AND`
+condition. It runs your tests once per break and reports the ones they missed.
 
 ```
 The tests caught 62 of 80 deliberate breaks in the changed lines.
