@@ -33,6 +33,11 @@ break is parsed again, and Go runs `go build ./...` before its tests. If the
 parser cannot install, those files are listed as skipped and the rest is
 checked as before.
 
+If your tests fail before anything is broken, the check cannot tell a break
+from what was already failing, so it stops. The report names the failing
+tests; the end of their output goes to the job log, where GitHub masks your
+secrets, and never into the report, which is posted where nothing is masked.
+
 ### Use it
 
 Save this as **`.github/workflows/truecount-mutation.yml`**. The Truecount App

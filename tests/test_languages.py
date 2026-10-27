@@ -1,5 +1,6 @@
 """Breaks for JavaScript, TypeScript, Go and Ruby through tree-sitter."""
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -129,3 +130,24 @@ def test_go_build_failures_are_unbuildable_not_caught(tmp_path):
     report = mutate.run(base, "HEAD", ["go", "test", "./..."], tmp_path, limit=10)
     # string - string does not compile: unbuildable, never counted as caught
     assert {m.operator: m.status for m in report.mutants}["+ → -"] == "unbuildable"
+
+
+def test_a_failing_baseline_names_the_failing_tests_and_logs_the_rest(tmp_path, capsys):
+    lib = "def big(n):\n    return n > 100\n"
+    test = "from lib import big\n\ndef test_big():\n    print('token=sekret')\n    assert big(5)\n"
+    base = repo_with(tmp_path, {"lib.py": lib, "test_lib.py": test}, {"lib.py": lib.replace("100", "101")})
+    report = mutate.run(base, "HEAD", ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_lib.py"], tmp_path)
+    assert report.error and report.mutants == []
+    assert report.baseline_failures == ["FAILED test_lib.py::test_big - assert False"]
+    data = report.to_dict()
+    assert "sekret" not in json.dumps(data)  # the report is posted unmasked: names only
+    assert "sekret" in capsys.readouterr().err  # the job log, which GitHub masks, has the output
+    assert "Failing before any break" in report.to_markdown()
+
+
+@pytest.mark.parametrize("line", [
+    "FAILED tests/test_a.py::test_x - AssertionError", "--- FAIL: TestName (0.00s)", "not ok 3 - discount for large orders",
+    "  ✕ renders the cart (5 ms)", "rspec ./spec/cart_spec.rb:12 # Cart totals", "FAIL src/cart.test.ts",
+])
+def test_failing_test_names_are_recognised_for_the_common_runners(line):
+    assert mutate.failing_tests(f"noise\n{line}\nmore noise") == [line.strip()]
