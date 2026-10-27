@@ -47,6 +47,20 @@ DEFAULT_MAX = 40
 # run its own clean-up, so the next run restores whatever it finds here first.
 BACKUP_DIR = ".truecount-mutate-backup"
 LOGGERS = {"log", "logger", "logging", "LOG", "LOGGER"}
+# When the tests fail before anything is broken, the last lines of their
+# output go to the job log, where GitHub masks secrets; the report, which
+# Truecount posts as a comment where nothing is masked, keeps only the names
+# of the failing tests, as each common runner prints them.
+BASELINE_TAIL_LINES = 40
+FAILING_TEST = re.compile(
+    r"^(?:FAILED |ERROR )\S+"           # pytest
+    r"|^--- FAIL: \S+"                  # go test
+    r"|^not ok \d+ - .+"                # node --test, TAP
+    r"|^\s*(?:✕|×) .+"                  # jest, vitest
+    r"|^rspec \./\S+"                   # rspec
+    r"|^FAIL \S+"                       # jest file summary
+)
+MAX_FAILING = 10
 
 NEGATE = {
     ast.Eq: ast.NotEq, ast.NotEq: ast.Eq,
@@ -289,8 +303,10 @@ def select(mutants: list[Mutant], limit: int) -> list[Mutant]:
 # ── Running the tests ─────────────────────────────────────────────────────
 
 
-def run_tests(command: list[str], cwd: Path, timeout: float | None, cache_dir: str) -> tuple[str, float]:
-    """'passed', 'failed' or 'timeout', and how long it took.
+def run_tests(command: list[str], cwd: Path, timeout: float | None, cache_dir: str,
+              output: Path | None = None) -> tuple[str, float]:
+    """'passed', 'failed' or 'timeout', and how long it took. With `output`,
+    the tests' stdout and stderr are written there instead of discarded.
 
     Bytecode caching is redirected to a fresh directory per run. A mutant the
     same size as the original (`==` to `!=`), written within the same second,
@@ -298,16 +314,35 @@ def run_tests(command: list[str], cwd: Path, timeout: float | None, cache_dir: s
     """
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONPYCACHEPREFIX=cache_dir)
     start = time.monotonic()
-    proc = subprocess.Popen(
-        command, cwd=cwd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
-    )
+    sink = output.open("wb") if output else subprocess.DEVNULL
     try:
-        code = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)  # the whole group: test runners fork workers
-        proc.wait()
-        return "timeout", time.monotonic() - start
+        proc = subprocess.Popen(
+            command, cwd=cwd, env=env, stdout=sink, stderr=subprocess.STDOUT if output else subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)  # the whole group: test runners fork workers
+            proc.wait()
+            return "timeout", time.monotonic() - start
+    finally:
+        if output:
+            sink.close()
     return ("passed" if code == 0 else "failed"), time.monotonic() - start
+
+
+def failing_tests(text: str) -> list[str]:
+    """The failing tests' names from a test run's output, as far as the common
+    runners print them recognisably. Names only: never the output itself."""
+    found = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if FAILING_TEST.match(line) and line not in found:
+            found.append(line.strip()[:200])
+            if len(found) == MAX_FAILING:
+                break
+    return found
 
 
 @dataclass
@@ -321,6 +356,7 @@ class Report:
     baseline_seconds: float | None = None
     error: str | None = None
     skipped: list[str] = field(default_factory=list)  # files that could not be broken, and why
+    baseline_failures: list[str] = field(default_factory=list)  # names of tests failing before any break
 
     def count(self, status: str) -> int:
         return sum(1 for m in self.mutants if m.status == status)
@@ -333,12 +369,16 @@ class Report:
             "error": self.error,
             "summary": {s: self.count(s) for s in ("killed", "survived", "timeout")},
             "skipped": self.skipped,
+            "baseline_failures": self.baseline_failures,
             "mutants": [m.to_dict() for m in self.mutants],
         }
 
     def to_markdown(self) -> str:
         if self.error:
-            return f"### Truecount mutation check\n\nNot run: {self.error}\n"
+            failing = "".join(f"\n- {_code(name)}" for name in self.baseline_failures)
+            return (f"### Truecount mutation check\n\nNot run: {self.error}\n"
+                    + (f"\nFailing before any break:{failing}\n" if failing else "")
+                    + "\nThe end of the test output is in this job's log.\n")
         ran = len(self.mutants) - self.count("unbuildable")
         if ran == 0:
             note = "".join(f"\n- {s}" for s in self.skipped)
@@ -411,9 +451,14 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
     if not report.mutants:
         return report
     with tempfile.TemporaryDirectory() as tmp:
-        status, report.baseline_seconds = run_tests(command, cwd, None, f"{tmp}/baseline")
+        log = Path(tmp) / "baseline.log"
+        status, report.baseline_seconds = run_tests(command, cwd, None, f"{tmp}/baseline", output=log)
         if status != "passed":
+            text = log.read_text(errors="replace")
+            tail = "\n".join(text.splitlines()[-BASELINE_TAIL_LINES:])
+            print(f"The tests failed before anything was broken. The end of their output:\n{tail}", file=sys.stderr)
             report.error = "the tests fail before anything is broken, so a break cannot be told from what is already failing"
+            report.baseline_failures = failing_tests(text)
             report.mutants = []
             return report
         timeout = max(10.0, report.baseline_seconds * 3 + 5)
