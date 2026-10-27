@@ -23,8 +23,15 @@ Not caught
 A break the tests miss marks behaviour no test pins down. Some breaks change
 nothing observable, so read a survivor as a lead, not a verdict.
 
-Python only for now. No model is involved, and the check uses only the
-standard library, so it adds nothing to your environment.
+It reads **Python, JavaScript, TypeScript, Go and Ruby**. No model is
+involved. Python needs only the standard library. For the other languages the
+Action installs a parser, tree-sitter, from pinned and hash-checked wheels into
+a separate environment in the runner's temp folder, and only when the change
+touches one of them, so nothing is added to your environment. A break that
+stops the code compiling is reported as unbuildable, never as caught: every
+break is parsed again, and Go runs `go build ./...` before its tests. If the
+parser cannot install, those files are listed as skipped and the rest is
+checked as before.
 
 ### Use it
 

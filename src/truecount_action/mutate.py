@@ -1,4 +1,6 @@
-"""Diff-scoped mutation testing for Python, with no model in the loop.
+"""Diff-scoped mutation testing, with no model in the loop: Python on the
+standard library's `ast`, and JavaScript, TypeScript, Go and Ruby through
+tree-sitter (languages.py).
 
 For each line a change touched, make one small deliberate break, run the
 tests, and record whether they noticed. A break the tests miss has
@@ -32,6 +34,11 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+
+try:
+    from . import languages
+except ImportError:  # run as a plain script by the Action: python mutate.py
+    import languages  # type: ignore[no-redef]
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 DEFAULT_MAX = 40
@@ -81,16 +88,21 @@ def parse_diff(text: str) -> dict[str, set[int]]:
 def is_test_path(path: str) -> bool:
     p = PurePosixPath(path)
     return (
-        any(part in ("tests", "test") for part in p.parts[:-1])
+        any(part in ("tests", "test", "spec", "__tests__") for part in p.parts[:-1])
         or p.name.startswith("test_")
-        or p.name.endswith("_test.py")
+        or p.name.endswith(("_test.py", "_test.go", "_spec.rb", "_test.rb"))
+        or ".test." in p.name
+        or ".spec." in p.name
         or p.name == "conftest.py"
     )
 
 
-def changed_python_lines(base: str, head: str, cwd: Path) -> dict[str, set[int]]:
+SOURCE_GLOBS = ["*.py", *(f"*{ext}" for ext in languages.EXTENSIONS)]
+
+
+def changed_source_lines(base: str, head: str, cwd: Path) -> dict[str, set[int]]:
     diff = subprocess.run(
-        ["git", "diff", "--unified=0", "--no-color", "--no-ext-diff", f"{base}...{head}", "--", "*.py"],
+        ["git", "diff", "--unified=0", "--no-color", "--no-ext-diff", f"{base}...{head}", "--", *SOURCE_GLOBS],
         cwd=cwd, capture_output=True, text=True, check=True,
     ).stdout
     return {
@@ -114,6 +126,10 @@ class Mutant:
     module: str = field(default="", repr=False)  # the unmutated module source
     status: str = "pending"  # killed / survived / timeout / unbuildable
     seconds: float = 0.0
+    # A tree-sitter break (languages.py) is a byte-range edit of `module`.
+    start_byte: int = field(default=-1, repr=False)
+    end_byte: int = field(default=-1, repr=False)
+    replacement: str = field(default="", repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -240,6 +256,8 @@ def generate(path: str, source: str, lines: set[int]) -> list[Mutant]:
 
 def build(mutant: Mutant) -> str | None:
     """The whole module with this one break applied, or None if it will not compile."""
+    if mutant.start_byte >= 0:
+        return languages.build(mutant)
     tree = ast.parse(mutant.module)
     target = list(ast.walk(tree))[mutant.node_index]
     replacement = dict(_breaks(target))[mutant.operator]
@@ -302,6 +320,7 @@ class Report:
     mutants: list[Mutant]
     baseline_seconds: float | None = None
     error: str | None = None
+    skipped: list[str] = field(default_factory=list)  # files that could not be broken, and why
 
     def count(self, status: str) -> int:
         return sum(1 for m in self.mutants if m.status == status)
@@ -313,6 +332,7 @@ class Report:
             "baseline_seconds": None if self.baseline_seconds is None else round(self.baseline_seconds, 2),
             "error": self.error,
             "summary": {s: self.count(s) for s in ("killed", "survived", "timeout")},
+            "skipped": self.skipped,
             "mutants": [m.to_dict() for m in self.mutants],
         }
 
@@ -321,7 +341,9 @@ class Report:
             return f"### Truecount mutation check\n\nNot run: {self.error}\n"
         ran = len(self.mutants) - self.count("unbuildable")
         if ran == 0:
-            return "### Truecount mutation check\n\nNothing to check: no changed Python lines outside tests offer a break.\n"
+            note = "".join(f"\n- {s}" for s in self.skipped)
+            return ("### Truecount mutation check\n\nNothing to check: no changed line outside the tests offers a break,"
+                    " in a language the check reads.\n" + (f"\nSkipped:{note}\n" if note else ""))
         caught = self.count("killed") + self.count("timeout")
         lines = [
             "### Truecount mutation check",
@@ -341,6 +363,8 @@ class Report:
                 "Each of these is a change the tests would let through. Some change nothing observable;"
                 " the rest name behaviour no test pins down.",
             ]
+        if self.skipped:
+            lines += ["", "**Skipped**", "", *(f"- {s}" for s in self.skipped)]
         return "\n".join(lines) + "\n"
 
 
@@ -370,11 +394,20 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
     restored = recover(cwd)
     if restored:
         print(f"restored files an interrupted run left broken: {', '.join(restored)}", file=sys.stderr)
-    changed = changed_python_lines(base, head, cwd)
+    changed = changed_source_lines(base, head, cwd)
     candidates: list[Mutant] = []
+    skipped: list[str] = []
     for path, lines in sorted(changed.items()):
-        candidates += generate(path, (cwd / path).read_text(), lines)
-    report = Report(base, head, command, sum(map(len, changed.values())), len(candidates), select(candidates, limit))
+        source = (cwd / path).read_text()
+        if path.endswith(".py"):
+            candidates += generate(path, source, lines)
+            continue
+        try:
+            candidates += languages.generate(path, source, lines, Mutant)
+        except languages.ParserMissing as err:
+            skipped.append(f"`{path}`: {err}")
+    report = Report(base, head, command, sum(map(len, changed.values())), len(candidates), select(candidates, limit),
+                    skipped=skipped)
     if not report.mutants:
         return report
     with tempfile.TemporaryDirectory() as tmp:
@@ -396,11 +429,17 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
             backup.write_bytes(original)
             try:
                 target.write_text(source)
-                status, mutant.seconds = run_tests(command, cwd, timeout, f"{tmp}/{i}")
+                # A compiled language's break that no longer builds would fail
+                # the tests and count as caught; it is unbuildable instead.
+                check = languages.build_check(mutant.path)
+                if check and run_tests(check, cwd, timeout, f"{tmp}/{i}-build")[0] != "passed":
+                    status = "unbuildable"
+                else:
+                    status, mutant.seconds = run_tests(command, cwd, timeout, f"{tmp}/{i}")
             finally:
                 target.write_bytes(original)
                 backup.unlink()
-            mutant.status = {"passed": "survived", "failed": "killed", "timeout": "timeout"}[status]
+            mutant.status = {"passed": "survived", "failed": "killed", "timeout": "timeout", "unbuildable": "unbuildable"}[status]
             if progress:
                 progress(i + 1, len(report.mutants), mutant)
     shutil.rmtree(cwd / BACKUP_DIR, ignore_errors=True)

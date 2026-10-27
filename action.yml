@@ -16,12 +16,30 @@ inputs:
     description: The most breaks to run. Each one runs your test command once.
     default: "40"
   python:
-    description: A Python 3.10+ interpreter. The check itself uses only the standard library.
+    description: A Python 3.10+ interpreter. Python changes need only the standard library; JavaScript, TypeScript, Go and Ruby changes install a pinned parser into a separate environment.
     default: python3
 
 runs:
   using: composite
   steps:
+    - name: Install the parser, if the change has JavaScript, TypeScript, Go or Ruby
+      shell: bash
+      env:
+        TC_BASE: ${{ inputs.base }}
+        TC_PYTHON: ${{ inputs.python }}
+        TC_REQUIREMENTS: ${{ github.action_path }}/requirements-parsers.txt
+      # Into its own environment under the runner's temp folder, never into
+      # yours, from pinned, hash-checked wheels and nothing built from source.
+      # If it cannot install, those files are reported as skipped and Python is
+      # checked as before.
+      run: |
+        if git diff --name-only "$TC_BASE"...HEAD -- '*.js' '*.jsx' '*.mjs' '*.cjs' '*.ts' '*.tsx' '*.go' '*.rb' | grep -q .; then
+          env_dir="$RUNNER_TEMP/truecount-parsers"
+          if "$TC_PYTHON" -m venv "$env_dir" && "$env_dir/bin/pip" install --quiet --disable-pip-version-check \
+              --require-hashes --only-binary=:all: --no-deps -r "$TC_REQUIREMENTS"; then
+            echo "TC_ENGINE_PYTHON=$env_dir/bin/python" >> "$GITHUB_ENV"
+          fi
+        fi
     - name: Run the mutation check
       shell: bash
       env:
@@ -35,7 +53,7 @@ runs:
       # error: it is in the report, which Truecount posts. Only a missing
       # report fails the job, in the upload step.
       run: |
-        "$TC_PYTHON" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" \
+        "${TC_ENGINE_PYTHON:-$TC_PYTHON}" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" \
           --json truecount-mutation.json --markdown "$GITHUB_STEP_SUMMARY" \
           -- bash -c "$TC_TESTS" || true
     - uses: actions/upload-artifact@v7
