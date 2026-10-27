@@ -1,0 +1,131 @@
+"""Breaks for JavaScript, TypeScript, Go and Ruby through tree-sitter."""
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from truecount_action import languages, mutate
+
+JS = """function price(qty, member) {
+  if (qty > 10 && !member) {
+    return qty * 2;
+  }
+  console.log("small order", qty > 1);
+  return qty + 1;
+}
+const label = `total: ${1 + 1}`;
+module.exports = { price };
+"""
+
+
+def offered(path, source, lines):
+    return [(m.line, m.operator) for m in languages.generate(path, source, lines, mutate.Mutant)]
+
+
+def test_javascript_offers_the_python_engines_breaks_on_changed_lines_only():
+    got = offered("src/price.js", JS, {2, 3, 6})
+    assert (2, "negate > → <=") in got and (2, "boundary > → >=") in got
+    assert (2, "&& → ||") in got and (2, "remove not") in got and (2, "negate condition") in got
+    assert (3, "* → /") in got and (3, "2 → 3") in got
+    assert (6, "+ → -") in got
+    assert {line for line, _ in got} == {2, 3, 6}
+
+
+def test_logging_template_strings_and_types_are_left_alone():
+    assert offered("src/price.js", JS, {5, 8}) == []
+    ts = "const f = (a: number, b: number): boolean => a <= b || false;\ntype N = 1 | 2;\n"
+    got = offered("src/f.ts", ts, {1, 2})
+    assert (1, "negate <= → >") in got and (1, "false → true") in got
+    assert all(line == 1 for line, _ in got)  # the type alias on line 2 is not code
+    assert not any(op.startswith(("1 →", "2 →")) for _, op in got)
+
+
+def test_go_and_ruby_breaks():
+    go = "package p\n\nfunc f(a, b int) bool {\n\tif a >= b && !ok() {\n\t\treturn a+1 > b\n\t}\n\treturn true\n}\n"
+    got = offered("p/f.go", go, {4, 5, 7})
+    assert (4, "negate >= → <") in got and (4, "negate condition") in got and (5, "+ → -") in got and (7, "true → false") in got
+    rb = "def f(a, b)\n  return a + 1 if a == b and !c\n  a < b || false\nend\n"
+    got = offered("lib/f.rb", rb, {2, 3})
+    assert (2, "negate == → !=") in got and (2, "and → or") in got and (3, "|| → &&") in got
+
+
+def test_a_break_is_a_byte_edit_and_one_that_stops_parsing_is_unbuildable():
+    m = next(m for m in languages.generate("src/price.js", JS, {6}, mutate.Mutant) if m.operator == "+ → -")
+    built = mutate.build(m)
+    assert built == JS.replace("return qty + 1;", "return qty - 1;")
+    m.replacement = "+ +("  # something that does not parse
+    assert mutate.build(m) is None
+
+
+def test_without_the_parser_the_files_are_skipped_and_python_still_runs(monkeypatch):
+    def missing(language):
+        raise languages.ParserMissing(f"breaking {language} needs tree-sitter, which is not installed here")
+
+    monkeypatch.setattr(languages, "_parser", missing)
+    with pytest.raises(languages.ParserMissing):
+        languages.generate("src/price.js", JS, {2}, mutate.Mutant)
+
+
+def test_test_files_in_every_language_are_not_broken():
+    for path in ("web/a.test.ts", "web/a.spec.js", "web/__tests__/a.js", "p/a_test.go", "spec/a_spec.rb", "test/a_test.rb"):
+        assert mutate.is_test_path(path), path
+    assert not mutate.is_test_path("web/contest.js")
+
+
+def git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def repo_with(tmp_path: Path, files: dict[str, str], change: dict[str, str]) -> str:
+    git(tmp_path, "init", "-q")
+    git(tmp_path, "config", "user.email", "t@example.com")
+    git(tmp_path, "config", "user.name", "t")
+    for name, text in files.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-qm", "base")
+    base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    for name, text in change.items():
+        (tmp_path / name).write_text(text)
+    git(tmp_path, "commit", "-qam", "change")
+    return base
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_end_to_end_on_a_javascript_project(tmp_path):
+    lib = "function discount(qty) {\n  return qty > 10 ? 5 : 0;\n}\nmodule.exports = { discount };\n"
+    changed = "function discount(qty) {\n  return qty >= 10 ? 5 : 0;\n}\nmodule.exports = { discount };\n"
+    test = ("const { test } = require('node:test');\nconst assert = require('node:assert');\n"
+            "const { discount } = require('../lib.js');\ntest('large', () => assert.equal(discount(50), 5));\n")
+    base = repo_with(tmp_path, {"lib.js": lib, "test/discount.test.js": test}, {"lib.js": changed})
+    report = mutate.run(base, "HEAD", ["node", "--test"], tmp_path, limit=10)
+    statuses = {m.operator: m.status for m in report.mutants}
+    assert statuses["negate >= → <"] == "killed"
+    assert statuses["boundary >= → >"] == "survived"  # nothing tests exactly 10
+    assert (tmp_path / "lib.js").read_text() == changed
+
+
+@pytest.mark.skipif(shutil.which("ruby") is None, reason="ruby is not installed")
+def test_end_to_end_on_a_ruby_project(tmp_path):
+    lib = "def big?(n)\n  n > 100\nend\n"
+    changed = "def big?(n)\n  n >= 100\nend\n"
+    test = "require_relative '../lib'\nabort('big') unless big?(500)\nabort('small') if big?(1)\n"
+    base = repo_with(tmp_path, {"lib.rb": lib, "test/big_test.rb": test}, {"lib.rb": changed})
+    report = mutate.run(base, "HEAD", ["ruby", "test/big_test.rb"], tmp_path, limit=10)
+    statuses = {m.operator: m.status for m in report.mutants}
+    assert statuses["negate >= → <"] == "killed" and statuses["boundary >= → >"] == "survived"
+
+
+@pytest.mark.skipif(shutil.which("go") is None, reason="go is not installed")
+def test_go_build_failures_are_unbuildable_not_caught(tmp_path):
+    files = {"go.mod": "module p\n\ngo 1.21\n", "p.go": "package p\n\nfunc Name(a string) string {\n\treturn a + \"!\"\n}\n",
+             "p_test.go": "package p\n\nimport \"testing\"\n\nfunc TestName(t *testing.T) {\n\tif Name(\"a\") != \"a!\" {\n\t\tt.Fail()\n\t}\n}\n"}
+    # The change and its test move together, so the baseline passes at the head.
+    base = repo_with(tmp_path, files, {"p.go": "package p\n\nfunc Name(a string) string {\n\treturn a + \"?\"\n}\n",
+                                       "p_test.go": files["p_test.go"].replace('"a!"', '"a?"')})
+    report = mutate.run(base, "HEAD", ["go", "test", "./..."], tmp_path, limit=10)
+    # string - string does not compile: unbuildable, never counted as caught
+    assert {m.operator: m.status for m in report.mutants}["+ → -"] == "unbuildable"

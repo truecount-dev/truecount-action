@@ -10,11 +10,22 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 # Standard library only: this runs inside customers' environments, next to
-# their dependencies, and must not add any of its own.
+# their dependencies, and must not add any of its own. Breaking languages other
+# than Python needs tree-sitter, which the Action installs into a separate
+# environment of its own, from requirements-parsers.txt (pinned and hashed).
 dependencies = []
 
+[project.optional-dependencies]
+parsers = [
+    "tree-sitter==0.26.0",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+    "tree-sitter-go==0.25.0",
+    "tree-sitter-ruby==0.23.1",
+]
+
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "truecount-action[parsers]"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/truecount_action"]
