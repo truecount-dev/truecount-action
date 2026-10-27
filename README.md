@@ -73,6 +73,7 @@ requests from forks too: the workflow needs no secrets and no token.
 | `test-command` | required | Exits non-zero when a test fails. `-x` makes each run stop at the first failure, which makes the whole check much faster. |
 | `base` | the pull request's base commit | What the change is measured against |
 | `max-mutants` | `40` | Each break runs the test command once |
+| `jobs` | `1` | Breaks to run at once, each in its own full copy of the checkout |
 | `python` | `python3` | Any 3.10+ interpreter |
 
 ### What it does to your checkout
@@ -81,6 +82,18 @@ It edits one file at a time, runs the tests, and restores the file. Each
 original is backed up to `.truecount-mutate-backup/` first, so if a run is
 killed mid-break, the next run puts the file back before doing anything else.
 It refuses to run if your tests already fail without any break.
+
+When the change is larger than `max-mutants`, the breaks are spread evenly
+from its first changed line to its last.
+
+With `jobs` above 1, it copies the whole checkout once per job, into the
+runner's temp folder, and breaks the copies instead. Your checkout is not
+edited at all. Each copy is checked first: every changed file is broken
+beyond parsing and the tests run once. If they still pass, the copy is running
+your original code (an editable install points there), so the breaks run one
+at a time in your checkout instead, and the job log says so. Leave `jobs` at 1
+if your tests share a fixed port, a fixed temp path or an outside database: two
+copies running at once would collide.
 
 ## License
 

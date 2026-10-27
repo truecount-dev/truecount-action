@@ -15,6 +15,9 @@ inputs:
   max-mutants:
     description: The most breaks to run. Each one runs your test command once.
     default: "40"
+  jobs:
+    description: Breaks to run at once, each in its own full copy of the checkout. Leave at 1 if your tests share a fixed port, a fixed temp path or an outside database.
+    default: "1"
   python:
     description: A Python 3.10+ interpreter. Python changes need only the standard library; JavaScript, TypeScript, Go and Ruby changes install a pinned parser into a separate environment.
     default: python3
@@ -45,6 +48,7 @@ runs:
       env:
         TC_BASE: ${{ inputs.base }}
         TC_MAX: ${{ inputs.max-mutants }}
+        TC_JOBS: ${{ inputs.jobs }}
         TC_PYTHON: ${{ inputs.python }}
         TC_TESTS: ${{ inputs.test-command }}
         TC_SCRIPT: ${{ github.action_path }}/src/truecount_action/mutate.py
@@ -53,7 +57,7 @@ runs:
       # error: it is in the report, which Truecount posts. Only a missing
       # report fails the job, in the upload step.
       run: |
-        "${TC_ENGINE_PYTHON:-$TC_PYTHON}" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" \
+        "${TC_ENGINE_PYTHON:-$TC_PYTHON}" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" --jobs "$TC_JOBS" \
           --json truecount-mutation.json --markdown "$GITHUB_STEP_SUMMARY" \
           -- bash -c "$TC_TESTS" || true
     - uses: actions/upload-artifact@v7
