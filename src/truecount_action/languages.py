@@ -4,8 +4,8 @@ Python keeps its own engine in mutate.py, on the standard library's `ast`.
 For JavaScript, TypeScript, Go and Ruby this module parses the file with
 tree-sitter and offers the same kinds of break on the changed lines: a
 flipped comparison, an off-by-one boundary, `&&` for `||`, swapped
-arithmetic, a removed `!`, a flipped boolean, an integer one higher, and a
-negated `if`. Each break is a byte-range edit of the original text, so the
+arithmetic, a removed `!`, a flipped boolean, an integer one higher, and an
+`if` whose condition never or always holds. Each break is a byte-range edit of the original text, so the
 rest of the file stays exactly as written.
 
 tree-sitter is the one thing the check ever installs, and only when a change
@@ -110,13 +110,19 @@ def _edits(node, source: bytes) -> list[tuple[str, int, int, bytes, str, str]]:
         condition = node.child_by_field_name("condition")
         if condition is not None:
             inner = source[condition.start_byte:condition.end_byte]
-            if condition.type == "parenthesized_expression":  # JavaScript keeps its parentheses
-                negated = b"(!" + inner + b")"
-            else:
-                negated = b"!(" + inner + b")"
+            parens = condition.type == "parenthesized_expression"  # JavaScript keeps its parentheses
             line = text.splitlines()[0] if text else node.type
-            out.append(("negate condition", condition.start_byte, condition.end_byte, negated, line,
-                        line.replace(inner.decode(), negated.decode(), 1)))
+            if node.child_by_field_name("initializer") is not None:
+                # Go's `if err := f(); err != nil`: a constant condition would
+                # leave err unused, which does not compile, so it is negated.
+                replacements = [("negate condition", b"(!" + inner + b")" if parens else b"!(" + inner + b")")]
+            else:
+                # As in Python: never taken (the guard is gone), then always taken.
+                replacements = [(f"condition → {value}", b"(" + value.encode() + b")" if parens else value.encode())
+                                for value in ("false", "true")]
+            for operator, replacement in replacements:
+                out.append((operator, condition.start_byte, condition.end_byte, replacement, line,
+                            line.replace(inner.decode(), replacement.decode(), 1)))
     return out
 
 
