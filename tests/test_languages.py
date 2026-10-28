@@ -152,6 +152,19 @@ def test_a_failing_baseline_names_the_failing_tests_and_logs_the_rest(tmp_path, 
     assert "Failing before any break" in report.to_markdown()
 
 
+@pytest.mark.skipif(shutil.which("go") is None, reason="go is not installed")
+def test_a_go_test_failing_before_any_break_is_skipped_and_the_rest_checked(tmp_path):
+    lib = "package p\n\nfunc Big(n int) bool {\n\treturn n > 100\n}\n"
+    tests = ("package p\n\nimport \"testing\"\n\nfunc TestBig(t *testing.T) {\n\tif !Big(500) || Big(1) {\n\t\tt.Fail()\n\t}\n}\n\n"
+             "func TestStale(t *testing.T) {\n\tt.Run(\"year\", func(t *testing.T) { t.Fail() })\n}\n")
+    base = repo_with(tmp_path, {"go.mod": "module p\n\ngo 1.21\n", "p.go": lib, "p_test.go": tests},
+                     {"p.go": lib.replace("n > 100", "n >= 100")})
+    report = mutate.run(base, "HEAD", ["go", "test", "./..."], tmp_path, limit=10)
+    assert report.error is None and report.set_aside == ["TestStale"]
+    statuses = {m.operator: m.status for m in report.mutants}
+    assert statuses["negate >= → <"] == "killed" and statuses["boundary >= → >"] == "survived"
+
+
 @pytest.mark.parametrize("line", [
     "FAILED tests/test_a.py::test_x - AssertionError", "--- FAIL: TestName (0.00s)", "not ok 3 - discount for large orders",
     "  ✕ renders the cart (5 ms)", "rspec ./spec/cart_spec.rb:12 # Cart totals", "FAIL src/cart.test.ts",

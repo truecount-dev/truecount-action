@@ -222,11 +222,57 @@ def test_end_to_end_finds_the_untested_branch_and_restores_every_file(project):
 
 
 def test_failing_baseline_is_reported_not_mutated(project):
+    # Every test fails: set aside, nothing is left to run, so nothing is checked.
     (project / "tests" / "test_calc.py").write_text("def test_broken():\n    assert False\n")
     git(project, "commit", "-q", "-am", "break")
     report = mutate.run("HEAD~2", "HEAD", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], project)
-    assert report.error and report.mutants == []
+    assert report.error and report.mutants == [] and report.set_aside == []
     assert "Not run:" in report.to_markdown()
+
+
+def test_tests_failing_before_any_break_are_set_aside_and_the_rest_checked(project, capsys):
+    # Two tests stale with the calendar, beside the real ones. With -x each
+    # baseline run stops at the first, so they are found one run at a time.
+    stale = "\n\ndef test_stale_a():\n    assert 2025 > 2026\n\n\ndef test_stale_b():\n    assert False\n"
+    (project / "tests" / "test_calc.py").write_text(TESTS + stale)
+    git(project, "commit", "-q", "-am", "stale")
+    command = [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"]
+    report = mutate.run("HEAD~2", "HEAD", command, project, limit=100)
+    assert report.error is None and report.baseline_failures == []
+    assert report.set_aside == ["tests/test_calc.py::test_stale_a", "tests/test_calc.py::test_stale_b"]
+    assert report.command == command  # the report names the command as given
+    status = {(m.line, m.operator): m.status for m in report.mutants}
+    assert status[(2, "negate < → >=")] == "killed" and status[(5, "return None")] == "survived"
+    assert "**Set aside**" in report.to_markdown() and "`tests/test_calc.py::test_stale_b`" in report.to_markdown()
+    assert report.to_dict()["set_aside"] == report.set_aside
+    assert "Set aside, failing before any break: tests/test_calc.py::test_stale_a" in capsys.readouterr().err
+    assert (project / "calc.py").read_text() == AFTER
+
+
+def test_a_collection_error_is_not_set_aside(project):
+    (project / "tests" / "test_broken.py").write_text("def test_x(:\n")
+    git(project, "add", "-A")
+    git(project, "commit", "-q", "-m", "syntax error in a test file")
+    report = mutate.run("HEAD~2", "HEAD", [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], project)
+    assert report.error and report.set_aside == [] and report.mutants == []
+
+
+def test_failing_ids_are_read_only_when_every_failure_is_a_named_test():
+    pytest_out = "x\nFAILED tests/t.py::test_a[a b] - assert 1 == 2\nERROR tests/t.py::test_b - fixture 'db' not found\n"
+    assert mutate.failing_ids(pytest_out) == ["tests/t.py::test_a[a b]", "tests/t.py::test_b"]
+    assert mutate.failing_ids("--- FAIL: TestBad (0.00s)\n    --- FAIL: TestBad/sub (0.00s)\n") == ["TestBad"]
+    assert mutate.failing_ids("ERROR tests/t.py - SyntaxError\nFAILED tests/u.py::test_c\n") is None
+    assert mutate.failing_ids("not ok 1 - discount\n") is None  # a runner that cannot leave a test out
+    assert mutate.failing_ids("Required test coverage of 90% not reached.\n") is None
+
+
+def test_set_aside_keeps_what_the_environment_already_sets(monkeypatch):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:randomly")
+    monkeypatch.delenv("GOFLAGS", raising=False)
+    assert mutate.set_aside_env(["tests/t.py::test_a[a b]", "TestBad", "TestOld"]) == [
+        "PYTEST_ADDOPTS=-p no:randomly --deselect 'tests/t.py::test_a[a b]'",
+        "GOFLAGS=-skip=^(TestBad|TestOld)$",
+    ]
 
 
 def test_cli_writes_json_and_markdown(project, monkeypatch, tmp_path_factory):
