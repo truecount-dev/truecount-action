@@ -33,10 +33,21 @@ break is parsed again, and Go runs `go build ./...` before its tests. If the
 parser cannot install, those files are listed as skipped and the rest is
 checked as before.
 
-If your tests fail before anything is broken, the check cannot tell a break
-from what was already failing, so it stops. The report names the failing
-tests; the end of their output goes to the job log, where GitHub masks your
-secrets, and never into the report, which is posted where nothing is masked.
+If some tests fail before anything is broken (stale with the calendar, say),
+the check sets them aside and checks the rest: pytest leaves them out through
+`PYTEST_ADDOPTS`, and `go test` skips them through `GOFLAGS`, however your
+test command is written. The report lists them under **Set aside**. A break
+that only they could catch reads as not caught.
+
+It stops instead when:
+- another runner is failing
+- a failure is not a named test (a collection error, a coverage threshold)
+- more than ten tests fail
+
+It stops because it cannot tell a break from what was already failing. The
+report names the failing tests. The end of their output goes to the job log,
+where GitHub masks your secrets, and never into the report, which is posted
+where nothing is masked.
 
 ### Use it
 
@@ -81,7 +92,7 @@ requests from forks too: the workflow needs no secrets and no token.
 It edits one file at a time, runs the tests, and restores the file. Each
 original is backed up to `.truecount-mutate-backup/` first, so if a run is
 killed mid-break, the next run puts the file back before doing anything else.
-It refuses to run if your tests already fail without any break.
+It refuses to run if your tests already fail without any break and the failing tests cannot be set aside.
 
 When the change is larger than `max-mutants`, the breaks are spread evenly
 from its first changed line to its last.

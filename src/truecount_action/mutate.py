@@ -28,6 +28,7 @@ import queue
 import threading
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -67,6 +68,15 @@ FAILING_TEST = re.compile(
     r"|^FAIL \S+"                       # jest file summary
 )
 MAX_FAILING = 10
+# Tests failing before any break (stale with the calendar, say) are set aside
+# and the rest checked, for the runners that can leave a named test out from
+# OUTSIDE the command line, so it works however the command is wrapped (the
+# Action runs `bash -c`): pytest through PYTEST_ADDOPTS, go test through
+# GOFLAGS. More than this many is a broken suite, not a stale test.
+MAX_SET_ASIDE = 10
+PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR) (\S+?::.+?)(?: - .*)?$")
+PYTEST_COLLECTION_ERROR = re.compile(r"^ERROR [^:\s]+(?: - .*)?$")
+GO_FAILED = re.compile(r"^--- FAIL: ([^\s/]+)")
 
 NEGATE = {
     ast.Eq: ast.NotEq, ast.NotEq: ast.Eq,
@@ -361,6 +371,32 @@ def failing_tests(text: str) -> list[str]:
     return found
 
 
+def failing_ids(text: str) -> list[str] | None:
+    """The failing tests in a pytest or go test run, as ids that can be left
+    out, or None when some failure is not a named test (a collection error, a
+    coverage threshold, another runner)."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    if any(PYTEST_COLLECTION_ERROR.match(line) for line in lines):
+        return None
+    ids = [m.group(1) for line in lines if (m := PYTEST_FAILED.match(line) or GO_FAILED.match(line))]
+    return list(dict.fromkeys(ids)) or None
+
+
+def set_aside_env(ids: list[str]) -> list[str]:
+    """`NAME=value` assignments, for `env`, that leave these tests out."""
+    def added(name: str, extra: str) -> str:  # after whatever the environment already sets
+        return f"{name}=" + " ".join(filter(None, [os.environ.get(name, "").strip(), extra]))
+
+    pytest_ids = [i for i in ids if "::" in i]
+    go_names = [i for i in ids if "::" not in i]
+    out = []
+    if pytest_ids:
+        out.append(added("PYTEST_ADDOPTS", " ".join(f"--deselect {shlex.quote(i)}" for i in pytest_ids)))
+    if go_names:
+        out.append(added("GOFLAGS", "-skip=^(" + "|".join(re.escape(n) for n in go_names) + ")$"))
+    return out
+
+
 @dataclass
 class Report:
     base: str
@@ -373,6 +409,7 @@ class Report:
     error: str | None = None
     skipped: list[str] = field(default_factory=list)  # files that could not be broken, and why
     baseline_failures: list[str] = field(default_factory=list)  # names of tests failing before any break
+    set_aside: list[str] = field(default_factory=list)  # failing before any break, left out of every run
 
     def count(self, status: str) -> int:
         return sum(1 for m in self.mutants if m.status == status)
@@ -386,6 +423,7 @@ class Report:
             "summary": {s: self.count(s) for s in ("killed", "survived", "timeout")},
             "skipped": self.skipped,
             "baseline_failures": self.baseline_failures,
+            "set_aside": self.set_aside,
             "mutants": [m.to_dict() for m in self.mutants],
         }
 
@@ -419,6 +457,11 @@ class Report:
                 "Each of these is a change the tests would let through. Some change nothing observable;"
                 " the rest name behaviour no test pins down.",
             ]
+        if self.set_aside:
+            lines += ["", "**Set aside**", "",
+                      "These tests failed before anything was broken, so every run left them out."
+                      " A break only they could catch reads as not caught.", "",
+                      *(f"- {_code(name)}" for name in self.set_aside)]
         if self.skipped:
             lines += ["", "**Skipped**", "", *(f"- {s}" for s in self.skipped)]
         return "\n".join(lines) + "\n"
@@ -523,15 +566,25 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
         return report
     with tempfile.TemporaryDirectory() as tmp:
         log = Path(tmp) / "baseline.log"
+        aside: list[str] = []
         status, report.baseline_seconds = run_tests(command, cwd, None, f"{tmp}/baseline", output=log)
-        if status != "passed":
+        while status != "passed" or (aside and "no tests to run" in log.read_text(errors="replace")):
             text = log.read_text(errors="replace")
             tail = "\n".join(text.splitlines()[-BASELINE_TAIL_LINES:])
             print(f"The tests failed before anything was broken. The end of their output:\n{tail}", file=sys.stderr)
-            report.error = "the tests fail before anything is broken, so a break cannot be told from what is already failing"
-            report.baseline_failures = failing_tests(text)
-            report.mutants = []
-            return report
+            report.baseline_failures += [f for f in failing_tests(text) if f not in report.baseline_failures]
+            new = [i for i in failing_ids(text) or [] if i not in aside] if status != "passed" else []
+            if not new or len(aside) + len(new) > MAX_SET_ASIDE:
+                report.error = "the tests fail before anything is broken, so a break cannot be told from what is already failing"
+                report.mutants = []
+                return report
+            aside += new
+            print(f"Set aside, failing before any break: {', '.join(new)}", file=sys.stderr)
+            status, report.baseline_seconds = run_tests(["env", *set_aside_env(aside), *command], cwd, None,
+                                                        f"{tmp}/baseline-{len(aside)}", output=log)
+        if aside:
+            command = ["env", *set_aside_env(aside), *command]
+            report.set_aside, report.baseline_failures = aside, []
         timeout = max(10.0, report.baseline_seconds * 3 + 5)
         copies = _copies(cwd, {m.path for m in report.mutants}, command, jobs, timeout, tmp) if jobs > 1 else []
         # Tests sharing the machine run slower, and a slow run is not a hang.
