@@ -24,6 +24,8 @@ import argparse
 import ast
 import copy
 import json
+import queue
+import threading
 import os
 import re
 import shutil
@@ -32,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -52,6 +55,9 @@ LOGGERS = {"log", "logger", "logging", "LOG", "LOGGER"}
 # Truecount posts as a comment where nothing is masked, keeps only the names
 # of the failing tests, as each common runner prints them.
 BASELINE_TAIL_LINES = 40
+# Appended to every changed file in one copy of the checkout, to prove the copy
+# runs its own code: a syntax error in Python, JavaScript, TypeScript, Go and Ruby.
+CANARY = "\n)\n"
 FAILING_TEST = re.compile(
     r"^(?:FAILED |ERROR )\S+"           # pytest
     r"|^--- FAIL: \S+"                  # go test
@@ -284,12 +290,22 @@ def build(mutant: Mutant) -> str | None:
     return source
 
 
+def evenly(items: list) -> list:
+    """The items in an order whose every prefix spreads across the whole list:
+    the first, the middle, the quarters, the eighths, and so on."""
+    bits = max(1, (len(items) - 1).bit_length())
+    return [items[i] for i in sorted(range(len(items)), key=lambda i: int(format(i, f"0{bits}b")[::-1], 2))]
+
+
 def select(mutants: list[Mutant], limit: int) -> list[Mutant]:
-    """Spread the budget: one break per changed line before a second on any."""
+    """Spread the budget over the whole change: every changed line weighs the
+    same, so a budget smaller than the change reaches from its first line to
+    its last, not just the first lines in file order. One break per changed
+    line before a second on any."""
     by_line: dict[tuple[str, int], list[Mutant]] = {}
     for m in sorted(mutants, key=lambda m: (m.path, m.line)):
         by_line.setdefault((m.path, m.line), []).append(m)
-    queues = list(by_line.values())
+    queues = [by_line[key] for key in evenly(sorted(by_line))]
     chosen: list[Mutant] = []
     depth = 0
     while len(chosen) < limit and any(depth < len(q) for q in queues):
@@ -430,7 +446,62 @@ def recover(cwd: Path) -> list[str]:
     return restored
 
 
-def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAULT_MAX, progress=None) -> Report:
+def _try(mutant: Mutant, root: Path, command: list[str], timeout: float, cache_dir: str) -> str:
+    """Break one file under `root`, run the tests there, and put the file back."""
+    source = build(mutant)
+    if source is None:
+        return "unbuildable"
+    target = root / mutant.path
+    original = target.read_bytes()
+    backup = root / BACKUP_DIR / mutant.path
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_bytes(original)
+    try:
+        target.write_text(source)
+        # A compiled language's break that no longer builds would fail
+        # the tests and count as caught; it is unbuildable instead.
+        check = languages.build_check(mutant.path)
+        if check and run_tests(check, root, timeout, f"{cache_dir}-build")[0] != "passed":
+            status = "unbuildable"
+        else:
+            status, mutant.seconds = run_tests(command, root, timeout, cache_dir)
+    finally:
+        target.write_bytes(original)
+        backup.unlink()
+    return {"passed": "survived", "failed": "killed", "timeout": "timeout", "unbuildable": "unbuildable"}[status]
+
+
+def _copies(cwd: Path, paths: set[str], command: list[str], jobs: int, timeout: float, tmp: str) -> list[Path]:
+    """One full copy of the checkout per break running at once, or none.
+
+    A copy is only useful if its tests run the copy's code. An editable
+    install (`pip install -e .`, a uv environment) points at the original
+    checkout, and the copy's tests would import the unbroken original: every
+    break would survive. So the first copy has every changed file broken
+    beyond parsing and runs the tests once. If they still pass, there are no
+    copies and the breaks run one at a time in place."""
+    copies = []
+    for n in range(jobs):
+        copy_root = Path(tmp) / f"copy-{n}" / cwd.name
+        shutil.copytree(cwd, copy_root, symlinks=True, ignore=shutil.ignore_patterns(BACKUP_DIR))
+        if n == 0:
+            originals = {path: (copy_root / path).read_bytes() for path in paths}
+            for path, data in originals.items():
+                (copy_root / path).write_bytes(data + CANARY.encode())
+            status, _ = run_tests(command, copy_root, timeout, f"{tmp}/canary")
+            for path, data in originals.items():
+                (copy_root / path).write_bytes(data)
+            if status == "passed":
+                print("--jobs: the tests still passed in a copy of the checkout with every changed file broken, so the"
+                      " copy does not run its own code (an editable install points at the original?) or the tests"
+                      " load none of the changed files. The breaks run one at a time, in place.", file=sys.stderr)
+                return []
+        copies.append(copy_root)
+    return copies
+
+
+def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAULT_MAX, progress=None,
+        jobs: int = 1) -> Report:
     restored = recover(cwd)
     if restored:
         print(f"restored files an interrupted run left broken: {', '.join(restored)}", file=sys.stderr)
@@ -462,31 +533,34 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
             report.mutants = []
             return report
         timeout = max(10.0, report.baseline_seconds * 3 + 5)
-        for i, mutant in enumerate(report.mutants):
-            source = build(mutant)
-            if source is None:
-                mutant.status = "unbuildable"
-                continue
-            target = cwd / mutant.path
-            original = target.read_bytes()
-            backup = cwd / BACKUP_DIR / mutant.path
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            backup.write_bytes(original)
-            try:
-                target.write_text(source)
-                # A compiled language's break that no longer builds would fail
-                # the tests and count as caught; it is unbuildable instead.
-                check = languages.build_check(mutant.path)
-                if check and run_tests(check, cwd, timeout, f"{tmp}/{i}-build")[0] != "passed":
-                    status = "unbuildable"
-                else:
-                    status, mutant.seconds = run_tests(command, cwd, timeout, f"{tmp}/{i}")
-            finally:
-                target.write_bytes(original)
-                backup.unlink()
-            mutant.status = {"passed": "survived", "failed": "killed", "timeout": "timeout", "unbuildable": "unbuildable"}[status]
+        copies = _copies(cwd, {m.path for m in report.mutants}, command, jobs, timeout, tmp) if jobs > 1 else []
+        # Tests sharing the machine run slower, and a slow run is not a hang.
+        timeout = max(10.0, report.baseline_seconds * 3 * max(1, len(copies)) + 5)
+        finished, lock = iter(range(1, len(report.mutants) + 1)), threading.Lock()
+
+        def attempt(i: int, mutant: Mutant, root: Path) -> None:
+            mutant.status = _try(mutant, root, command, timeout, f"{tmp}/{i}")
             if progress:
-                progress(i + 1, len(report.mutants), mutant)
+                with lock:
+                    progress(next(finished), len(report.mutants), mutant)
+
+        if copies:
+            free: queue.Queue[Path] = queue.Queue()
+            for root in copies:
+                free.put(root)
+
+            def in_a_copy(i: int, mutant: Mutant) -> None:
+                root = free.get()
+                try:
+                    attempt(i, mutant, root)
+                finally:
+                    free.put(root)
+
+            with ThreadPoolExecutor(len(copies)) as pool:
+                list(pool.map(in_a_copy, range(len(report.mutants)), report.mutants))
+        else:
+            for i, mutant in enumerate(report.mutants):
+                attempt(i, mutant, cwd)
     shutil.rmtree(cwd / BACKUP_DIR, ignore_errors=True)
     return report
 
@@ -496,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base", required=True, help="commit or ref the change is measured against")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--max", type=int, default=DEFAULT_MAX, help="most breaks to run")
+    parser.add_argument("--jobs", type=int, default=1,
+                        help="breaks to run at once, each in its own full copy of the checkout")
     parser.add_argument("--json", type=Path, help="write the full report here")
     parser.add_argument("--markdown", type=Path, help="write the summary here")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- then the test command")
@@ -507,7 +583,7 @@ def main(argv: list[str] | None = None) -> int:
     def progress(done, total, mutant):
         print(f"[{done}/{total}] {mutant.status:8} {mutant.path}:{mutant.line} {mutant.operator}", file=sys.stderr)
 
-    report = run(args.base, args.head, command, Path.cwd(), args.max, progress)
+    report = run(args.base, args.head, command, Path.cwd(), args.max, progress, args.jobs)
     if args.json:
         args.json.write_text(json.dumps(report.to_dict(), indent=2))
     markdown = report.to_markdown()

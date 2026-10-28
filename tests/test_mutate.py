@@ -101,10 +101,17 @@ def test_each_built_mutant_changes_one_thing_and_compiles():
 def test_select_spreads_the_budget_across_lines():
     mutants = mutate.generate("m.py", SAMPLE, {6, 9, 13})
     chosen = mutate.select(mutants, 4)
-    assert [(m.line, m.operator) for m in chosen] == [
-        (6, "negate condition"), (9, "negate condition"), (13, "return None"), (6, "negate == → !="),
-    ]
+    assert sorted(m.line for m in chosen[:3]) == [6, 9, 13]  # one on each line before a second on any
     assert len(mutate.select(mutants, 1000)) == len(mutants)
+
+
+def test_a_small_budget_reaches_across_the_whole_change():
+    # A hundred changed lines in two files and a budget of four: the first four
+    # lines in file order would leave b.py and most of a.py untouched.
+    mutants = [mutate.Mutant(path, n, "op", "", "") for path in ("a.py", "b.py") for n in range(1, 51)]
+    assert [(m.path, m.line) for m in mutate.select(mutants, 4)] == [
+        ("a.py", 1), ("b.py", 15), ("a.py", 33), ("b.py", 47),  # positions 0, 64, 32 and 96 of 100
+    ]
 
 
 def test_test_runs_never_read_stale_bytecode(monkeypatch, tmp_path):
@@ -250,3 +257,27 @@ def test_run_recovers_before_it_reads_the_diff(project):
     report = mutate.run("HEAD~1", "HEAD", [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"], project, limit=1)
     assert (project / "calc.py").read_text() == AFTER
     assert report.mutants and report.mutants[0].status in ("killed", "survived")
+
+
+def test_jobs_run_breaks_at_once_in_copies_and_agree_with_one_at_a_time(project):
+    command = [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"]
+    serial = mutate.run("HEAD~1", "HEAD", command, project, limit=100)
+    parallel = mutate.run("HEAD~1", "HEAD", command, project, limit=100, jobs=3)
+    assert [(m.line, m.operator, m.status) for m in parallel.mutants] == \
+        [(m.line, m.operator, m.status) for m in serial.mutants]
+    assert (project / "calc.py").read_text() == AFTER
+    git(project, "diff", "--exit-code")
+    assert not (project / mutate.BACKUP_DIR).exists()
+
+
+def test_a_copy_that_runs_the_original_code_falls_back_to_one_at_a_time(project, capsys):
+    # What an editable install does: the copy's tests import the original checkout.
+    (project / "tests" / "conftest.py").write_text(f"import sys\nsys.path.insert(0, {str(project)!r})\n")
+    git(project, "add", "-A")
+    git(project, "commit", "-q", "-m", "editable")
+    command = [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"]
+    report = mutate.run("HEAD~2", "HEAD", command, project, limit=100, jobs=3)
+    assert "--jobs: the tests still passed in a copy" in capsys.readouterr().err
+    # Run in place instead, so the copy's blindness cannot make a break survive.
+    assert {(m.line, m.operator): m.status for m in report.mutants}[(2, "negate < → >=")] == "killed"
+    assert (project / "calc.py").read_text() == AFTER
