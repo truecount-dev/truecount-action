@@ -132,6 +132,29 @@ requests from forks too: the workflow needs no secrets and no token.
 | `jobs` | `1` | Breaks to run at once, each in its own full copy of the checkout |
 | `python` | `python3` | Any 3.10+ interpreter |
 
+### Browser tests (Playwright, Selenium)
+
+Any test command works, browser suites included, with two things to know.
+
+**The app under test must be started from the checkout on every run.** Each
+break edits a source file, and only an app started after the edit contains it.
+Playwright's `webServer` does this, starting the app for each `npx playwright
+test`, as long as `reuseExistingServer` is off. A Selenium suite needs a fixture
+that starts the app the same way. A suite that tests a server already running,
+or a bundle built before the check, never sees a break. So before any break,
+the check breaks every changed file at once and runs the tests: if they still
+pass, it stops and says so rather than report every break as not caught.
+
+**Browser suites are slow, and each break runs the tests again.** End-to-end
+specs are named after features (`checkout.spec.ts`), not source files
+(`cart.ts`), so `related-test-command` seldom narrows them and most breaks run
+the whole suite. Point `test-command` at your unit tests and keep the browser
+suite in its own workflow, or narrow it with Playwright's `--project` or
+`--grep`, and keep `jobs` at 1 if `webServer` uses a fixed port.
+
+The check breaks Python, JavaScript, TypeScript, Go and Ruby, so a Selenium
+suite in Java has nothing here to break.
+
 ### Run it on your own machine
 
 The check runs your tests once per break, on GitHub's hosted runners unless you
@@ -159,7 +182,8 @@ hosted runners cost nothing there anyway.
 It edits one file at a time, runs the tests, and restores the file. Each
 original is backed up to `.truecount-mutate-backup/` first, so if a run is
 killed mid-break, the next run puts the file back before doing anything else.
-It refuses to run if your tests already fail without any break and the failing tests cannot be set aside.
+It refuses to run if your tests already fail without any break and the failing tests cannot be set aside,
+or if they still pass with every changed file broken, which means they never run the changed code.
 
 When the change is larger than `max-mutants`, the breaks are spread evenly
 from its first changed line to its last.

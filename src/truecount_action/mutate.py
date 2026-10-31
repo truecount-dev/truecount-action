@@ -68,6 +68,7 @@ FAILING_TEST = re.compile(
     r"|^\s*(?:✕|×) .+"                  # jest, vitest
     r"|^rspec \./\S+"                   # rspec
     r"|^FAIL \S+"                       # jest file summary
+    r"|^\s*\d+\) \[[^\]]+\] › .+"           # playwright's failure summary, every reporter
 )
 MAX_FAILING = 10
 # Tests failing before any break (stale with the calendar, say) are set aside
@@ -378,7 +379,7 @@ def failing_tests(text: str) -> list[str]:
     for line in text.splitlines():
         line = line.rstrip()
         if FAILING_TEST.match(line) and line not in found:
-            found.append(line.strip()[:200])
+            found.append(line.strip().rstrip("─ ")[:200])  # playwright rules its summary lines off
             if len(found) == MAX_FAILING:
                 break
     return found
@@ -447,7 +448,7 @@ class Report:
             failing = "".join(f"\n- {_code(name)}" for name in self.baseline_failures)
             return (f"### Truecount mutation check\n\nNot run: {self.error}\n"
                     + (f"\nFailing before any break:{failing}\n" if failing else "")
-                    + "\nThe end of the test output is in this job's log.\n")
+                    + ("" if self.error == NOT_THIS_CODE else "\nThe end of the test output is in this job's log.\n"))
         ran = len(self.mutants) - self.count("unbuildable")
         if ran == 0:
             note = "".join(f"\n- {s}" for s in self.skipped)
@@ -537,6 +538,35 @@ def _try(mutant: Mutant, root: Path, command: list[str], timeout: float, cache_d
     return {"passed": "survived", "failed": "killed", "timeout": "timeout", "unbuildable": "unbuildable"}[status]
 
 
+NOT_THIS_CODE = (
+    "no test ran the changed code: with every changed file broken, the tests still passed. They run another copy"
+    " of it (a server already running, a prebuilt bundle, an install outside this checkout) or none of these files,"
+    " so every break would read as not caught"
+)
+
+
+def _tests_run_this_code(root: Path, paths: set[str], command: list[str], timeout: float, cache_dir: str) -> bool:
+    """Whether the tests load any of these files from this checkout. Each is
+    broken beyond parsing and the tests run once; they must fail. A browser
+    suite against a server that was already running, or a bundle built before
+    the break, passes, and so does a suite that loads none of the files."""
+    originals: dict[str, bytes] = {}
+    try:
+        for path in paths:
+            target = root / path
+            originals[path] = target.read_bytes()
+            backup = root / BACKUP_DIR / path
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_bytes(originals[path])
+            target.write_bytes(originals[path] + CANARY.encode())
+        status, _ = run_tests(command, root, timeout, cache_dir)
+    finally:
+        for path, data in originals.items():
+            (root / path).write_bytes(data)
+            (root / BACKUP_DIR / path).unlink(missing_ok=True)
+    return status != "passed"
+
+
 def _copies(cwd: Path, paths: set[str], command: list[str], jobs: int, timeout: float, tmp: str) -> list[Path]:
     """One full copy of the checkout per break running at once, or none.
 
@@ -621,6 +651,11 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
         for m in report.mutants:
             m.scope = commands[m.path][1]
         timeout = max(10.0, report.baseline_seconds * 3 + 5)
+        if not _tests_run_this_code(cwd, {m.path for m in report.mutants}, command, timeout, f"{tmp}/canary-in-place"):
+            print(f"Not run: {NOT_THIS_CODE}.", file=sys.stderr)
+            report.error, report.mutants = NOT_THIS_CODE, []
+            shutil.rmtree(cwd / BACKUP_DIR, ignore_errors=True)
+            return report
         copies = _copies(cwd, {m.path for m in report.mutants}, command, jobs, timeout, tmp) if jobs > 1 else []
         # Tests sharing the machine run slower, and a slow run is not a hang.
         timeout = max(10.0, report.baseline_seconds * 3 * max(1, len(copies)) + 5)
