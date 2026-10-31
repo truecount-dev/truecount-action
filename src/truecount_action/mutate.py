@@ -40,9 +40,10 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 try:
-    from . import languages, sql
+    from . import languages, related, sql
 except ImportError:  # run as a plain script by the Action: python mutate.py
     import languages  # type: ignore[no-redef]
+    import related  # type: ignore[no-redef]
     import sql  # type: ignore[no-redef]
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -75,6 +76,8 @@ MAX_FAILING = 10
 # Action runs `bash -c`): pytest through PYTEST_ADDOPTS, go test through
 # GOFLAGS. More than this many is a broken suite, not a stale test.
 MAX_SET_ASIDE = 10
+# The pull request label that makes every break run the whole suite (README).
+ALL_TESTS_LABEL = "truecount: all tests"
 PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR) (\S+?::.+?)(?: - .*)?$")
 PYTEST_COLLECTION_ERROR = re.compile(r"^ERROR [^:\s]+(?: - .*)?$")
 GO_FAILED = re.compile(r"^--- FAIL: ([^\s/]+)")
@@ -161,12 +164,13 @@ class Mutant:
     start_byte: int = field(default=-1, repr=False)
     end_byte: int = field(default=-1, repr=False)
     replacement: str = field(default="", repr=False)
+    scope: str = "full"  # "related": only the tests named like its file ran (related.py)
 
     def to_dict(self) -> dict:
         return {
             "path": self.path, "line": self.line, "operator": self.operator,
             "original": self.original, "mutated": self.mutated,
-            "status": self.status, "seconds": round(self.seconds, 2),
+            "status": self.status, "seconds": round(self.seconds, 2), "scope": self.scope,
         }
 
 
@@ -419,6 +423,7 @@ class Report:
     skipped: list[str] = field(default_factory=list)  # files that could not be broken, and why
     baseline_failures: list[str] = field(default_factory=list)  # names of tests failing before any break
     set_aside: list[str] = field(default_factory=list)  # failing before any break, left out of every run
+    related_command: str = ""  # the related-tests template, when breaks may run only their own tests
 
     def count(self, status: str) -> int:
         return sum(1 for m in self.mutants if m.status == status)
@@ -433,6 +438,7 @@ class Report:
             "skipped": self.skipped,
             "baseline_failures": self.baseline_failures,
             "set_aside": self.set_aside,
+            "related_command": self.related_command,
             "mutants": [m.to_dict() for m in self.mutants],
         }
 
@@ -454,11 +460,16 @@ class Report:
             f"The tests caught **{caught} of {ran}** deliberate breaks in the changed lines."
             f" Possible breaks: {self.candidates}; run: {ran}.",
         ]
+        narrowed = sum(1 for m in self.mutants if m.scope == "related" and m.status != "unbuildable")
+        if narrowed:
+            lines += ["", f"{narrowed} of the {ran} ran only the tests named like the file they broke;"
+                          f" {ran - narrowed} ran the whole suite."]
         survivors = sorted((m for m in self.mutants if m.status == "survived"), key=lambda m: (m.path, m.line))
         if survivors:
             lines += ["", "**Not caught**", ""]
             lines += [
                 f"- `{m.path}:{m.line}` {_code(m.original)} → {_code(m.mutated)} ({m.operator})"
+                + (" — related tests only" if m.scope == "related" else "")
                 for m in survivors
             ]
             lines += [
@@ -466,6 +477,9 @@ class Report:
                 "Each of these is a change the tests would let through. Some change nothing observable;"
                 " the rest name behaviour no test pins down.",
             ]
+            if any(m.scope == "related" for m in survivors):
+                lines += ["", f"A test elsewhere may still catch those marked related tests only. Add the"
+                              f" `{ALL_TESTS_LABEL}` label to run every test for every break."]
         if self.set_aside:
             lines += ["", "**Set aside**", "",
                       "These tests failed before anything was broken, so every run left them out."
@@ -553,7 +567,10 @@ def _copies(cwd: Path, paths: set[str], command: list[str], jobs: int, timeout: 
 
 
 def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAULT_MAX, progress=None,
-        jobs: int = 1) -> Report:
+        jobs: int = 1, related_command: str = "", all_tests: bool = False) -> Report:
+    """`related_command` holds `{tests}` or `{packages}`: each break runs it with
+    the tests named like its file, and the whole suite when there are none.
+    `all_tests` runs the whole suite for every break regardless."""
     restored = recover(cwd)
     if restored:
         print(f"restored files an interrupted run left broken: {', '.join(restored)}", file=sys.stderr)
@@ -570,7 +587,7 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
         except languages.ParserMissing as err:
             skipped.append(f"`{path}`: {err}")
     report = Report(base, head, command, sum(map(len, changed.values())), len(candidates), select(candidates, limit),
-                    skipped=skipped)
+                    skipped=skipped, related_command="" if all_tests else related_command)
     if not report.mutants:
         return report
     with tempfile.TemporaryDirectory() as tmp:
@@ -591,9 +608,18 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
             print(f"Set aside, failing before any break: {', '.join(new)}", file=sys.stderr)
             status, report.baseline_seconds = run_tests(["env", *set_aside_env(aside), *command], cwd, None,
                                                         f"{tmp}/baseline-{len(aside)}", output=log)
+        prefix = ["env", *set_aside_env(aside)] if aside else []
         if aside:
-            command = ["env", *set_aside_env(aside), *command]
+            command = [*prefix, *command]
             report.set_aside, report.baseline_failures = aside, []
+        tracked = related.tree(cwd) if report.related_command else []
+        commands: dict[str, tuple[list[str], str]] = {}
+        for path in {m.path for m in report.mutants}:
+            narrowed = related.command_for(report.related_command, path, tracked) if report.related_command else None
+            # The set-aside tests stay out of a related run too.
+            commands[path] = ([*prefix, "bash", "-c", narrowed], "related") if narrowed else (command, "full")
+        for m in report.mutants:
+            m.scope = commands[m.path][1]
         timeout = max(10.0, report.baseline_seconds * 3 + 5)
         copies = _copies(cwd, {m.path for m in report.mutants}, command, jobs, timeout, tmp) if jobs > 1 else []
         # Tests sharing the machine run slower, and a slow run is not a hang.
@@ -601,7 +627,7 @@ def run(base: str, head: str, command: list[str], cwd: Path, limit: int = DEFAUL
         finished, lock = iter(range(1, len(report.mutants) + 1)), threading.Lock()
 
         def attempt(i: int, mutant: Mutant, root: Path) -> None:
-            mutant.status = _try(mutant, root, command, timeout, f"{tmp}/{i}")
+            mutant.status = _try(mutant, root, commands[mutant.path][0], timeout, f"{tmp}/{i}")
             if progress:
                 with lock:
                     progress(next(finished), len(report.mutants), mutant)
@@ -634,6 +660,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max", type=int, default=DEFAULT_MAX, help="most breaks to run")
     parser.add_argument("--jobs", type=int, default=1,
                         help="breaks to run at once, each in its own full copy of the checkout")
+    parser.add_argument("--related", default="", metavar="COMMAND",
+                        help="run only each break's related tests: COMMAND with {tests} (test files) or {packages}")
+    parser.add_argument("--all-tests", action="store_true", help="every break runs the whole suite, --related or not")
     parser.add_argument("--json", type=Path, help="write the full report here")
     parser.add_argument("--markdown", type=Path, help="write the summary here")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- then the test command")
@@ -641,11 +670,13 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the test command after --, e.g. -- python -m pytest -x -q")
+    if args.related and not any(p in args.related for p in related.PLACEHOLDERS):
+        parser.error("--related needs {tests} or {packages} where the tests go, e.g. 'python -m pytest -x -q {tests}'")
 
     def progress(done, total, mutant):
         print(f"[{done}/{total}] {mutant.status:8} {mutant.path}:{mutant.line} {mutant.operator}", file=sys.stderr)
 
-    report = run(args.base, args.head, command, Path.cwd(), args.max, progress, args.jobs)
+    report = run(args.base, args.head, command, Path.cwd(), args.max, progress, args.jobs, args.related, args.all_tests)
     if args.json:
         args.json.write_text(json.dumps(report.to_dict(), indent=2))
     markdown = report.to_markdown()

@@ -15,6 +15,12 @@ inputs:
   max-mutants:
     description: The most breaks to run. Each one runs your test command once.
     default: "40"
+  related-test-command:
+    description: Runs only the tests a break needs, with {tests} where the test files go (or {packages} for go test), e.g. "python -m pytest -x -q {tests}". Each break runs the tests named like the file it broke, and the whole suite when none are. Blank runs the whole suite for every break.
+    default: ""
+  all-tests:
+    description: "true runs the whole suite for every break, related-test-command or not. The README's workflow sets it from the `truecount: all tests` pull request label."
+    default: "false"
   jobs:
     description: Breaks to run at once, each in its own full copy of the checkout. Leave at 1 if your tests share a fixed port, a fixed temp path or an outside database.
     default: "1"
@@ -49,6 +55,8 @@ runs:
         TC_BASE: ${{ inputs.base }}
         TC_MAX: ${{ inputs.max-mutants }}
         TC_JOBS: ${{ inputs.jobs }}
+        TC_RELATED: ${{ inputs.related-test-command }}
+        TC_ALL_TESTS: ${{ inputs.all-tests }}
         TC_PYTHON: ${{ inputs.python }}
         TC_TESTS: ${{ inputs.test-command }}
         TC_SCRIPT: ${{ github.action_path }}/src/truecount_action/mutate.py
@@ -57,7 +65,10 @@ runs:
       # error: it is in the report, which Truecount posts. Only a missing
       # report fails the job, in the upload step.
       run: |
-        "${TC_ENGINE_PYTHON:-$TC_PYTHON}" "$TC_SCRIPT" --base "$TC_BASE" --max "$TC_MAX" --jobs "$TC_JOBS" \
+        args=(--base "$TC_BASE" --max "$TC_MAX" --jobs "$TC_JOBS")
+        if [ -n "$TC_RELATED" ]; then args+=(--related "$TC_RELATED"); fi
+        if [ "$TC_ALL_TESTS" = "true" ]; then args+=(--all-tests); fi
+        "${TC_ENGINE_PYTHON:-$TC_PYTHON}" "$TC_SCRIPT" "${args[@]}" \
           --json truecount-mutation.json --markdown "$GITHUB_STEP_SUMMARY" \
           -- bash -c "$TC_TESTS" || true
     - uses: actions/upload-artifact@v7

@@ -57,11 +57,21 @@ looks for exactly that file name, to post the result on the pull request.
 
 ```yaml
 name: Truecount mutation check
-on: pull_request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
 permissions:
   contents: read
 jobs:
   mutation:
+    # Not on drafts. Of all the labels, only `truecount: all tests` starts a run.
+    if: >-
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' || github.event.label.name == 'truecount: all tests')
+    # A new push cancels the run it replaces, so you pay for the latest only.
+    concurrency:
+      group: truecount-mutation-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -74,7 +84,39 @@ jobs:
       - uses: truecount-dev/truecount-action@v0
         with:
           test-command: python -m pytest -x -q
+          related-test-command: python -m pytest -x -q {tests}
+          # Quoted: the label's ": " would otherwise end the YAML value early.
+          all-tests: "${{ contains(github.event.pull_request.labels.*.name, 'truecount: all tests') }}"
 ```
+
+It runs when a pull request is opened, pushed to, reopened or marked ready for
+review, and never on a draft. Each break runs only the tests named like the file
+it broke (`billing.py` → `test_billing.py`, `billing.test.js`,
+`billing_test.go`'s package), and the whole suite when no test is named like it.
+The baseline, run once before any break, is always the whole suite.
+
+A test elsewhere might catch a break its related tests miss, so the report marks
+those survivors **related tests only**. To run every test for every break, add
+the label `truecount: all tests` to the pull request. It starts a run at once,
+and every push runs in full while the label stays on. Create the label once:
+
+```bash
+gh label create "truecount: all tests" --color 5319e7 --description "The mutation check runs the whole test suite for every break, not only the related tests"
+```
+
+`related-test-command` is your own test command with `{tests}` where the test
+files go, or `{packages}` for runners that take packages:
+
+| Runner | `related-test-command` |
+|---|---|
+| pytest | `python -m pytest -x -q {tests}` |
+| Jest | `npx jest --bail {tests}` |
+| Vitest | `npx vitest run --bail 1 {tests}` |
+| node --test | `node --test {tests}` |
+| RSpec | `bundle exec rspec --fail-fast {tests}` |
+| go test | `go test -failfast {packages}` |
+
+Leave it out and every break runs `test-command`, the whole suite.
 
 The summary appears on the workflow run's page. With the Truecount App
 installed, it is also posted on the pull request, which works for pull
@@ -84,9 +126,33 @@ requests from forks too: the workflow needs no secrets and no token.
 |---|---|---|
 | `test-command` | required | Exits non-zero when a test fails. `-x` makes each run stop at the first failure, which makes the whole check much faster. |
 | `base` | the pull request's base commit | What the change is measured against |
+| `related-test-command` | blank | Each break runs only the tests named like its file: `{tests}` or `{packages}` marks where they go |
+| `all-tests` | `false` | `true` runs the whole suite for every break; set from the label above |
 | `max-mutants` | `40` | Each break runs the test command once |
 | `jobs` | `1` | Breaks to run at once, each in its own full copy of the checkout |
 | `python` | `python3` | Any 3.10+ interpreter |
+
+### Run it on your own machine
+
+The check runs your tests once per break, on GitHub's hosted runners unless you
+say otherwise. On a public repository those minutes are free; on a private one
+they count against your plan, and the hosted machines are small. You can run it
+on a machine of your own instead, as a self-hosted runner:
+
+1. Use a virtual machine or container that does nothing else: not a laptop, and
+   nothing that holds production credentials or can reach production systems.
+   Pull requests run their own code on it.
+2. In the repository's settings, open **Actions → Runners → New self-hosted
+   runner**, follow GitHub's commands, and add `--ephemeral` to `config.sh` so
+   every job starts from a clean runner. Give it a label, such as `truecount`.
+3. In the workflow, replace `runs-on: ubuntu-latest` with
+   `runs-on: [self-hosted, truecount]`, and set `jobs` to about half the
+   machine's cores.
+
+**Private repositories only.** On a public repository anyone can open a pull
+request from a fork, and its code would run on your machine. GitHub warns
+against self-hosted runners on public repositories for this reason. Their
+hosted runners cost nothing there anyway.
 
 ### What it does to your checkout
 
