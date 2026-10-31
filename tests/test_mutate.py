@@ -331,3 +331,25 @@ def test_a_copy_that_runs_the_original_code_falls_back_to_one_at_a_time(project,
     # Run in place instead, so the copy's blindness cannot make a break survive.
     assert {(m.line, m.operator): m.status for m in report.mutants}[(2, "negate < → >=")] == "killed"
     assert (project / "calc.py").read_text() == AFTER
+
+
+def test_tests_that_never_run_the_changed_code_stop_the_check_and_say_why(tmp_path):
+    # What a browser suite against a server started before the break looks
+    # like: the tests exercise a copy (here dist/calc.py) the change never touches.
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "dist").mkdir()
+    (tmp_path / "pytest.ini").write_text("[pytest]\npythonpath = .\n")
+    (tmp_path / "calc.py").write_text(BEFORE)
+    (tmp_path / "dist" / "calc.py").write_text(AFTER)
+    (tmp_path / "tests" / "test_calc.py").write_text(TESTS.replace("from calc import", "from dist.calc import"))
+    git(tmp_path, "init", "-q", "-b", "main")
+    git(tmp_path, "add", "-A")
+    git(tmp_path, "commit", "-q", "-m", "base")
+    (tmp_path / "calc.py").write_text(AFTER)
+    git(tmp_path, "commit", "-q", "-am", "clamp")
+    report = mutate.run("HEAD~1", "HEAD", [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"], tmp_path)
+    assert report.error == mutate.NOT_THIS_CODE and report.mutants == []
+    markdown = report.to_markdown()
+    assert "Not run: no test ran the changed code" in markdown and "job's log" not in markdown
+    assert (tmp_path / "calc.py").read_text() == AFTER and not (tmp_path / mutate.BACKUP_DIR).exists()
+    git(tmp_path, "diff", "--exit-code")

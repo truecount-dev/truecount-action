@@ -171,3 +171,10 @@ def test_a_go_test_failing_before_any_break_is_skipped_and_the_rest_checked(tmp_
 ])
 def test_failing_test_names_are_recognised_for_the_common_runners(line):
     assert mutate.failing_tests(f"noise\n{line}\nmore noise") == [line.strip()]
+
+
+def test_playwright_failures_are_named_from_its_summary_without_the_rule():
+    out = ("Running 3 tests using 1 worker\n  ✓  1 [chromium] › tests/home.spec.ts:3:5 › loads (1.1s)\n"
+           "  1) [chromium] › tests/cart.spec.ts:12:5 › adds an item ──────────────────────\n"
+           "    Error: expect(received).toBe(expected)\n  1 failed\n")
+    assert mutate.failing_tests(out) == ["1) [chromium] › tests/cart.spec.ts:12:5 › adds an item"]
