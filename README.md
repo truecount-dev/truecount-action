@@ -197,6 +197,19 @@ at a time in your checkout instead, and the job log says so. Leave `jobs` at 1
 if your tests share a fixed port, a fixed temp path or an outside database: two
 copies running at once would collide.
 
+## Bug reproduction (not released)
+
+`src/truecount_action/repro.py` turns an issue into one new test file that
+fails because of the reported bug and will pass once it is fixed. It reads
+the code, writes the test, runs it (at most 6 runs in 20 tool calls) and
+stops when the failure is the bug, not an import error or a typo. It asserts
+the correct behaviour, never the buggy one, so the test cannot lock the bug
+in.
+
+It is not wired to a workflow trigger yet. Truecount scores it against real
+issues from public projects first, running this same loop in a container:
+does its test fail before the maintainers' fix and pass after it?
+
 ## License
 
 MIT
