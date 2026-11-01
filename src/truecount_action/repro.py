@@ -33,7 +33,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .related import is_test
+try:
+    from .related import is_test
+except ImportError:  # run as a script from the Action, beside related.py
+    from related import is_test  # type: ignore[no-redef]
 
 MAX_CALLS = 20
 MAX_RUNS = 6
@@ -111,8 +114,9 @@ class Checkout(Workspace):
     """A git checkout, with the project's own command for one test file:
     `{tests}` in it becomes the file's path."""
 
-    def __init__(self, root: Path, test_command: str = "python -m pytest -q {tests}", timeout: int = 600):
-        self.root, self.test_command, self.timeout = Path(root), test_command, timeout
+    def __init__(self, root: Path, test_command: str = "python -m pytest -q {tests}", timeout: int = 600,
+                 env: dict[str, str] | None = None):
+        self.root, self.test_command, self.timeout, self.env = Path(root), test_command, timeout, env
 
     def _git(self, *args: str) -> str:
         return subprocess.run(["git", *args], cwd=self.root, capture_output=True, text=True).stdout
@@ -139,7 +143,8 @@ class Checkout(Workspace):
     def run(self, path):
         command = self.test_command.replace("{tests}", shlex.quote(path))
         try:
-            p = subprocess.run(["bash", "-c", command], cwd=self.root, capture_output=True, text=True, timeout=self.timeout)
+            p = subprocess.run(["bash", "-c", command], cwd=self.root, capture_output=True, text=True, timeout=self.timeout,
+                               env=self.env)
         except subprocess.TimeoutExpired:
             return 124, f"the test run took longer than {self.timeout} seconds and was stopped"
         return p.returncode, p.stdout + p.stderr
@@ -210,6 +215,7 @@ def _tool(workspace: Workspace, result: Result, name: str, args: dict, max_runs:
             return f"refused: {problem}"
         workspace.write(path, content)
         result.test_path, result.test = path, content
+        result.last_exit, result.last_output = None, ""  # a run of the old text says nothing about this one
         return f"wrote {path}"
     if name == "run_test":
         if not result.test_path:

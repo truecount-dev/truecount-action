@@ -3,7 +3,7 @@
 The parts of [Truecount](https://truecount.dev) that run in **your** GitHub
 Actions runner. Your code only executes here, never on Truecount's servers.
 
-Today that is the mutation check.
+Today that is the mutation check and bug reproduction.
 
 ## Mutation check
 
@@ -197,18 +197,87 @@ at a time in your checkout instead, and the job log says so. Leave `jobs` at 1
 if your tests share a fixed port, a fixed temp path or an outside database: two
 copies running at once would collide.
 
-## Bug reproduction (not released)
+## Bug reproduction
 
-`src/truecount_action/repro.py` turns an issue into one new test file that
-fails because of the reported bug and will pass once it is fixed. It reads
-the code, writes the test, runs it (at most 6 runs in 20 tool calls) and
-stops when the failure is the bug, not an import error or a typo. It asserts
-the correct behaviour, never the buggy one, so the test cannot lock the bug
-in.
+Turns an issue into one new test that fails because of the reported bug, and
+opens it as a draft pull request. The agent reads your code, writes the
+test, runs it (at most 6 runs in 20 tool calls) and stops when the failure is
+the bug, not an import error or a typo. It asserts the correct behaviour,
+never the buggy one, so the test does not lock the bug in. Truecount opens
+the pull request; it can add test files only. The draft holds the test until
+someone fixes the bug, and the fix can go on the same branch.
 
-It is not wired to a workflow trigger yet. Truecount scores it against real
-issues from public projects first, running this same loop in a container:
-does its test fail before the maintainers' fix and pass after it?
+Included in the paid plans. It is scored on real issues from public Python
+projects: does its test fail before the maintainers' fix and pass after it?
+
+```yaml
+name: Truecount bug reproduction
+
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: The issue number
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  id-token: write   # how Truecount knows which repository and run is asking
+
+concurrency:
+  group: truecount-repro-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    # A new issue, or a maintainer asking with the label.
+    if: >-
+      github.event_name == 'workflow_dispatch' || github.event.action == 'opened' ||
+      github.event.label.name == 'truecount: reproduce'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false   # keep the job's token out of .git/config
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install -e . pytest   # your project and its test dependencies
+      - uses: truecount-dev/truecount-action/bug-repro@v0
+        with:
+          test-command: python -m pytest -q {tests}
+          issue: ${{ github.event.issue.number || inputs.issue }}
+```
+
+### Who starts it
+
+Anyone can open an issue, and the issue's text steers a model that writes
+code and runs it in your runner. So Truecount checks the person who
+triggered the run. When the issue's author has write access, the run starts
+when it is opened. Anyone else's issue waits: the step ends, without
+failing, saying a maintainer adds the `truecount: reproduce` label to ask.
+That label event's author is the maintainer, and the run starts.
+
+### What the test can reach
+
+The test runs in your job, like any test, but the job's credentials are
+removed from its environment first: the OIDC request token, the Actions
+runtime token and the GitHub token. Two things only your workflow can do,
+and the sample does both: `persist-credentials: false` on the checkout, and
+no secrets in this job's environment.
+
+### What happens
+
+- **Reproduced**: a draft pull request titled `Reproduce #N: <title>`, adding
+  the test and showing its failure. The job summary links it.
+- **Not reproduced**: nothing is posted. The job summary says why and shows
+  the test it tried.
+- **Not started** (no write access, the plan, or the month's runs used up):
+  the step ends without failing and says which.
 
 ## License
 
