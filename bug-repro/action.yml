@@ -1,0 +1,41 @@
+name: Truecount bug reproduction
+description: Turn an issue into a test that fails because of the bug, and open it as a draft pull request.
+author: Truecount
+branding:
+  icon: alert-circle
+  color: green
+
+inputs:
+  test-command:
+    description: Runs one test file, with {tests} where its path goes, e.g. "python -m pytest -q {tests}". Install your project and its test dependencies in an earlier step.
+    required: true
+  issue:
+    description: The issue to reproduce. Defaults to the issue that triggered the run; pass a number on workflow_dispatch.
+    default: ${{ github.event.issue.number }}
+  github-token:
+    description: "Reads the issue when it is passed by number. Needs `issues: read`."
+    default: ${{ github.token }}
+  api-url:
+    description: Truecount's API.
+    default: https://api.truecount.dev
+  python:
+    description: A Python 3.10+ interpreter. The agent needs only the standard library.
+    default: python3
+
+runs:
+  using: composite
+  steps:
+    - name: Reproduce the issue as a test
+      shell: bash
+      env:
+        TC_ISSUE: ${{ inputs.issue }}
+        TC_TESTS: ${{ inputs.test-command }}
+        TC_API: ${{ inputs.api-url }}
+        TC_PYTHON: ${{ inputs.python }}
+        TC_GITHUB_TOKEN: ${{ inputs.github-token }}
+        TC_SCRIPT: ${{ github.action_path }}/../src/truecount_action/repro_run.py
+      # Inputs arrive as environment variables, never pasted into the script,
+      # so a value cannot inject shell. The test it writes runs without the
+      # job's credentials in its environment (repro_run.clean_env).
+      run: |
+        "$TC_PYTHON" "$TC_SCRIPT" --test-command "$TC_TESTS" --issue "$TC_ISSUE" --api "$TC_API"
