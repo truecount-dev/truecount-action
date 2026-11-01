@@ -117,3 +117,25 @@ def test_cache_hints_mark_the_system_prompt_and_the_newest_message(checkout):
     assert second[-1]["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert isinstance(second[1]["content"], str)
     assert isinstance(repro.reproduce(Model({"content": "{}"}), checkout, "t", "b").usage, list)
+
+
+@pytest.mark.parametrize("start, end, expected", [
+    (40, None, (40, None)), ("40", "60", (40, 60)), ("1,60", None, (1, 60)), ([80, 185], None, (80, 185)),
+    ("300-330", None, (300, 330)), (None, None, (None, None)), ("", "", (None, None)), ("[455, ", None, (455, None)),
+])
+def test_line_ranges_are_read_however_the_model_writes_them(start, end, expected):
+    assert repro.line_range(start, end) == expected
+
+
+def test_a_tool_that_fails_tells_the_model_and_the_run_goes_on(checkout):
+    class Broken(repro.Checkout):
+        def search(self, text):
+            raise OSError("grep went away")
+
+    broken = Broken(checkout.root, checkout.test_command)
+    model = Model(tools(call("search", text="add"), call("read_file", path="calc.py", start="[1, 2]")),
+                  {"content": '{"reproduced": false, "summary": "s"}'})
+    result = repro.reproduce(model, broken, "t", "b")
+    results = [m["content"] for m in model.requests[1]["messages"] if m["role"] == "tool"]
+    assert results == ["the tool failed: OSError: grep went away", "1: def add(a, b):\n2:     return a - b"]
+    assert result.stopped == "answered"

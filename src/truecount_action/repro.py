@@ -26,6 +26,7 @@ and collaborators start a run unasked.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field
@@ -175,6 +176,16 @@ def check_path(path: str, workspace: Workspace, written: str) -> str | None:
     return None
 
 
+def line_range(start, end) -> tuple[int | None, int | None]:
+    """Line numbers as models actually send them: 40, "40", "1,60",
+    [80, 185] or "300-330", the last three meaning a whole range in `start`."""
+    numbers = lambda v: [int(n) for n in re.findall(r"\d+", str(v))] if v not in (None, "") else []  # noqa: E731
+    first, second = numbers(start), numbers(end)
+    if len(first) >= 2 and not second:
+        return first[0], first[1]
+    return (first[0] if first else None), (second[0] if second else None)
+
+
 def _tool(workspace: Workspace, result: Result, name: str, args: dict, max_runs: int) -> str:
     if name == "list_files":
         files = workspace.list_files(str(args.get("dir") or "").strip("/"))
@@ -185,8 +196,9 @@ def _tool(workspace: Workspace, result: Result, name: str, args: dict, max_runs:
         if text is None:
             return "no such file"
         lines = text.splitlines()
-        start = max(1, int(args.get("start") or 1))
-        end = min(len(lines), int(args.get("end") or start + READ_LINES - 1), start + READ_LINES - 1)
+        start, end = line_range(args.get("start"), args.get("end"))
+        start = max(1, start or 1)
+        end = min(len(lines), end or start + READ_LINES - 1, start + READ_LINES - 1)
         return "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1)) or "the file is empty"
     if name == "search":
         hits = workspace.search(str(args.get("text", "")))
@@ -272,5 +284,8 @@ def reproduce(chat: Callable[[dict], dict], workspace: Workspace, title: str, bo
                     args = json.loads(call["function"].get("arguments") or "{}")
                 except ValueError:
                     args = {}
-                content = _tool(workspace, result, call["function"]["name"], args if isinstance(args, dict) else {}, max_runs)
+                try:
+                    content = _tool(workspace, result, call["function"]["name"], args if isinstance(args, dict) else {}, max_runs)
+                except Exception as err:  # noqa: BLE001 - a bad argument is the model's to correct, not the end of the run
+                    content = f"the tool failed: {type(err).__name__}: {err}"
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": content[:20000]})
