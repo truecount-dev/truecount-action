@@ -160,6 +160,7 @@ class Result:
     last_exit: int | None = None
     last_output: str = ""
     stopped: str = ""  # answered, out_of_calls, no_answer
+    answer: str = ""  # the final reply as written, for when it could not be read
     usage: list[dict] = field(default_factory=list)
 
 
@@ -258,9 +259,12 @@ def reproduce(chat: Callable[[dict], dict], workspace: Workspace, title: str, bo
                                     f"The issue, as reported:\n\n# {title}\n\n{body}"},
     ]
     asked_to_finish = 0
+    asked_for_json = False
     while True:
         request = {"messages": _cached(messages) if cache_hints else messages, "max_tokens": MAX_TOKENS}
-        if result.calls < max_calls:
+        if asked_for_json:
+            pass  # no tools: only the answer is missing
+        elif result.calls < max_calls:
             request["tools"] = TOOLS
         elif asked_to_finish == 2:  # out of calls, and asked twice for the answer
             result.stopped = "out_of_calls"
@@ -272,8 +276,20 @@ def reproduce(chat: Callable[[dict], dict], workspace: Workspace, title: str, bo
         message = reply["choices"][0]["message"]
         wanted = message.get("tool_calls") or []
         if not wanted:
-            result.stopped = "answered" if _answer(message.get("content") or "", result) else "no_answer"
-            return result
+            text = message.get("content") or ""
+            result.answer = text[-2000:]
+            if _answer(text, result):
+                result.stopped = "answered"
+                return result
+            if asked_for_json or not result.test_path:
+                result.stopped = "no_answer"
+                return result
+            # The test is written and the reply only lacks its form: ask once more, no
+            # tools. Sonnet 5.5 ended 3 of 37 yardstick runs with a right test and no JSON.
+            asked_for_json = True
+            messages += [{"role": "assistant", "content": text or "(no reply)"},
+                         {"role": "user", "content": "Reply now with the JSON only, in the shape the first message gives."}]
+            continue
         messages.append({k: message[k] for k in ("role", "content", "tool_calls") if k in message})
         for call in wanted:
             if result.calls >= max_calls:

@@ -139,3 +139,17 @@ def test_a_tool_that_fails_tells_the_model_and_the_run_goes_on(checkout):
     results = [m["content"] for m in model.requests[1]["messages"] if m["role"] == "tool"]
     assert results == ["the tool failed: OSError: grep went away", "1: def add(a, b):\n2:     return a - b"]
     assert result.stopped == "answered"
+
+
+def test_a_reply_without_its_json_is_asked_for_once_more(checkout):
+    model = Model(tools(call("write_test", path="tests/test_add_issue.py", content=REPRO)),
+                  {"content": "Done: the test fails because add subtracts."},
+                  {"content": '{"reproduced": true, "test_path": "tests/test_add_issue.py", "summary": "add subtracts"}'})
+    result = repro.reproduce(model, checkout, "t", "b")
+    assert (result.stopped, result.reproduced, result.summary, result.calls) == ("answered", True, "add subtracts", 1)
+    assert "tools" not in model.requests[2] and model.requests[2]["messages"][-1]["content"].startswith("Reply now")
+    # Asked once only, and only when there is a test to report on.
+    twice = repro.reproduce(Model(tools(call("write_test", path="tests/test_b.py", content=REPRO)),
+                                  {"content": "done"}, {"content": "still prose"}), checkout, "t", "b")
+    assert (twice.stopped, twice.answer) == ("no_answer", "still prose")
+    assert repro.reproduce(Model({"content": "no test, no json"}), checkout, "t", "b").stopped == "no_answer"
