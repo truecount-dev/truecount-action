@@ -75,11 +75,28 @@ def token(api: str, agent: str, env: dict, out) -> int:
     return 0
 
 
+def agent_error(env: dict) -> str:
+    """Why the agent stopped, from the run record claude-code-action keeps: the
+    error text only, never the transcript, which may hold the code it read."""
+    record = Path(env.get("RUNNER_TEMP") or "/tmp") / "claude-execution-output.json"
+    try:
+        entries = json.loads(record.read_text())
+    except (OSError, ValueError):
+        return ""
+    results = [e for e in entries if isinstance(e, dict) and e.get("type") == "result"] if isinstance(entries, list) else []
+    if not results or not results[-1].get("is_error"):
+        return ""
+    last = results[-1]
+    return str(last.get("result") or last.get("subtype") or "")[:500]
+
+
 def post(api: str, file: str, env: dict, out) -> int:
     path = Path(env.get("GITHUB_WORKSPACE") or ".") / file
     if not path.is_file() or not path.read_text().strip():
         # The fleet's rule: a review that was never posted is worth nothing, and must not look like a clean run.
-        print(f"::error::the agent wrote no {file}, so there is nothing to post", file=out)
+        why = agent_error(env)
+        print(f"::error::the agent wrote no {file}, so there is nothing to post"
+              + (f". It stopped with: {why}" if why else ""), file=out)
         return 1
     status, data = repro_run.request(f"{api}/api/v1/comment", {"body": path.read_text()}, token=env.get("TC_TOKEN", ""),
                                      timeout=60)

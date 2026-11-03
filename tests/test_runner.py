@@ -68,3 +68,14 @@ def test_post_sends_the_file_and_fails_loudly_when_the_agent_wrote_nothing(tmp_p
     (tmp_path / "review.md").write_text("Findings: none.\n\n**What I checked** ...")
     assert runner.main(["post", "review.md"], env=env(tmp_path, TC_TOKEN="run-tok"), out=io.StringIO()) == 0
     assert seen[-1] == (f"{API}/api/v1/comment", {"body": "Findings: none.\n\n**What I checked** ..."}, "run-tok")
+
+
+def test_a_failed_agent_says_why_without_its_transcript(tmp_path, monkeypatch):
+    monkeypatch.setattr(repro_run, "request", fake({}, []))
+    (tmp_path / "claude-execution-output.json").write_text(json.dumps([
+        {"type": "assistant", "message": {"content": "secret code it read"}},
+        {"type": "result", "is_error": True, "result": "API Error: 400 unknown field context_management"}]))
+    out = io.StringIO()
+    assert runner.main(["post", "review.md"], env=env(tmp_path, RUNNER_TEMP=str(tmp_path)), out=out) == 1
+    assert "It stopped with: API Error: 400 unknown field context_management" in out.getvalue()
+    assert "secret code" not in out.getvalue()
