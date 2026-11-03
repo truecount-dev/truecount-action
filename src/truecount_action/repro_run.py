@@ -42,6 +42,7 @@ except ImportError:  # run as a script from the Action
 
 AGENT = "bug_repro"
 AUDIENCE = "https://truecount.dev"
+EXCHANGE_SECONDS = 60
 CALL_SECONDS = 150  # longer than Cloudflare's 100-second cut, so the cut is what ends a stuck call
 OUTPUT_IN_BODY = 4000
 SECRET_ENV = ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_RUNTIME_TOKEN",
@@ -73,6 +74,10 @@ def request(url: str, body: dict | None = None, token: str = "", timeout: int = 
             return err.code, json.loads(err.read() or b"{}")
         except ValueError:
             return err.code, {"error": f"HTTP {err.code}"}
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        # Status 0: no answer at all. Callers say so; none of them crash on it.
+        reason = getattr(err, "reason", err)
+        return 0, {"error": f"no answer from {urllib.parse.urlsplit(url).netloc}: {reason}"}
 
 
 def read_issue(env: dict, issue_arg: str) -> dict:
@@ -105,10 +110,13 @@ def oidc_token(env: dict) -> str:
 
 
 def exchange(api: str, oidc: str) -> str:
-    status, data = request(f"{api}/api/v1/token", {"agent": AGENT}, token=oidc)
+    # Longer than other calls: a server process's first exchange fetches GitHub's signing keys.
+    status, data = request(f"{api}/api/v1/token", {"agent": AGENT}, token=oidc, timeout=EXCHANGE_SECONDS)
     if status == 200 and data.get("token"):
         return data["token"]
     reason = data.get("error") or data.get("reason") or f"HTTP {status}"
+    if status == 0:
+        raise Stop(f"Truecount did not answer: {reason}", failed=True)
     # Refused by rule (who asked, the plan, the month's runs): not a failure of the job.
     raise Stop(f"Truecount did not start this run: {reason}", failed=status >= 500 or status in (400, 401))
 

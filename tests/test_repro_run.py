@@ -172,3 +172,35 @@ def test_a_rewrite_clears_the_last_run(tmp_path):
     ws = repro.Checkout(tmp_path)
     assert repro._tool(ws, result, "write_test", {"path": "tests/test_a.py", "content": "x"}, 6) == "wrote tests/test_a.py"
     assert (result.last_exit, result.last_output) == (None, "")
+
+
+def test_no_answer_from_the_server_is_reported_not_a_crash(job, monkeypatch):
+    import urllib.error
+
+    def silent(req, timeout=30):
+        raise TimeoutError("The read operation timed out")
+
+    monkeypatch.setattr(repro_run.urllib.request, "urlopen", silent)
+    assert repro_run.request(f"{API}/api/v1/token", {"agent": "bug_repro"}) == \
+        (0, {"error": "no answer from api.example.test: The read operation timed out"})
+    with pytest.raises(repro_run.Stop) as stop:
+        repro_run.exchange(API, "oidc-jwt")
+    assert stop.value.failed and str(stop.value).startswith("Truecount did not answer: no answer from api.example.test")
+
+    def refused(req, timeout=30):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(repro_run.urllib.request, "urlopen", refused)
+    status, data = repro_run.request(f"{API}/api/v1/pulls", {})
+    assert status == 0 and "Connection refused" in data["error"]
+
+
+def test_the_exchange_waits_longer_than_other_calls(monkeypatch):
+    seen = {}
+
+    def fake(url, body=None, token="", timeout=30):
+        seen["timeout"] = timeout
+        return 200, {"token": "t"}
+
+    monkeypatch.setattr(repro_run, "request", fake)
+    assert repro_run.exchange(API, "oidc") == "t" and seen["timeout"] == repro_run.EXCHANGE_SECONDS > 30
