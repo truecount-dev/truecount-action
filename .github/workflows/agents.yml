@@ -1,0 +1,112 @@
+# Truecount's agents, in your runner.
+#
+# Call it from one workflow file in your repository:
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   permissions:
+#     contents: read
+#     pull-requests: read
+#     id-token: write   # how Truecount knows which repository and run is asking
+#   jobs:
+#     truecount:
+#       uses: truecount-dev/truecount-action/.github/workflows/agents.yml@v1
+#       # with:
+#       #   runs-on: '["self-hosted", "linux"]'   # your own machines; private repositories only
+#
+# The agents are the fleet's own (fleet-ci), run the way the fleet runs them:
+# Claude Code with a checkout and a turn budget. Truecount holds their
+# definitions and serves them per event (the plan job), its model proxy is
+# where Claude Code's requests go, and it posts what the agents write. Nothing
+# here holds a token that can write to your repository.
+name: Truecount agents
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: Where the agents run, as JSON. '"ubuntu-latest"' (default) or your own, e.g. '["self-hosted", "linux"]'.
+        type: string
+        default: '"ubuntu-latest"'
+      api-url:
+        description: Truecount's API.
+        type: string
+        default: https://api.truecount.dev
+
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      agents: ${{ steps.plan.outputs.agents }}
+    steps:
+      - name: Check out Truecount's steps
+        uses: actions/checkout@v7
+        with:
+          repository: truecount-dev/truecount-action
+          ref: ${{ github.job_workflow_sha }}
+          path: .truecount
+          sparse-checkout: src/truecount_action
+      - name: Ask Truecount which agents run
+        id: plan
+        env:
+          TC_API: ${{ inputs.api-url }}
+        run: python3 .truecount/src/truecount_action/runner.py plan
+
+  agent:
+    needs: plan
+    if: needs.plan.outputs.agents != '' && needs.plan.outputs.agents != '[]'
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.plan.outputs.agents) }}
+    name: ${{ matrix.agent.name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false   # the job's token stays out of .git/config
+      - name: Check out Truecount's steps
+        uses: actions/checkout@v7
+        with:
+          repository: truecount-dev/truecount-action
+          ref: ${{ github.job_workflow_sha }}
+          path: .truecount
+          sparse-checkout: src/truecount_action
+      - name: Start the run
+        id: token
+        env:
+          TC_API: ${{ inputs.api-url }}
+          TC_AGENT: ${{ matrix.agent.name }}
+        # Values arrive as environment variables, never pasted into the script.
+        run: python3 .truecount/src/truecount_action/runner.py token "$TC_AGENT"
+      - name: ${{ matrix.agent.name }}
+        uses: anthropics/claude-code-action@v1
+        # As the fleet's: the agent going wrong does not fail the job by itself.
+        # The post step does, when nothing was written.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_BASE_URL: ${{ inputs.api-url }}
+          ANTHROPIC_AUTH_TOKEN: ${{ steps.token.outputs.token }}
+        with:
+          github_token: ${{ github.token }}
+          anthropic_api_key: ${{ steps.token.outputs.token }}
+          prompt: ${{ matrix.agent.prompt }}
+          claude_args: ${{ matrix.agent.claude_args }}
+      - name: Post what the agent wrote
+        env:
+          TC_API: ${{ inputs.api-url }}
+          TC_TOKEN: ${{ steps.token.outputs.token }}
+          TC_OUTPUT: ${{ matrix.agent.output }}
+        run: python3 .truecount/src/truecount_action/runner.py post "$TC_OUTPUT"
