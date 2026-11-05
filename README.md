@@ -3,7 +3,45 @@
 The parts of [Truecount](https://truecount.dev) that run in **your** GitHub
 Actions runner. Your code only executes here, never on Truecount's servers.
 
-Today that is the mutation check and bug reproduction.
+Today that is Truecount's agents (pull request review), the mutation check
+and bug reproduction. The full documentation is at
+[truecount.dev/docs](https://truecount.dev/docs/).
+
+## Agents
+
+Truecount's pull request reviewer runs here, with Claude Code, in your runner.
+Truecount's server holds its prompt and turn budget, chooses its model, and
+posts what it writes as the Truecount App. Nothing in the workflow can write to
+your repository. Add one file, **`.github/workflows/truecount-agents.yml`**:
+
+```yaml
+name: Truecount agents
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write   # how Truecount knows which repository and run is asking
+jobs:
+  truecount:
+    uses: truecount-dev/truecount-action/.github/workflows/agents.yml@v0
+```
+
+It reviews every push to a pull request that is not a draft, editing one
+comment in place. It holds the change to your repository's
+`.github/review-guidelines.md` as of the base commit, and to a shared file
+your repositories name in `.github/truecount.yml`, or to
+[Truecount's default guidelines](https://truecount.dev/docs/review-guidelines/)
+when there is neither.
+
+| Input | Default | |
+|---|---|---|
+| `runs-on` | `"ubuntu-latest"` | Where the agents run, as JSON: `'["self-hosted", "linux"]'` for your own machines, on private repositories only |
+| `api-url` | `https://api.truecount.dev` | Truecount's API |
+
+GitHub gives a pull request from a fork no OIDC token, so nothing runs for
+one here. Truecount's server reviews it instead.
 
 ## Mutation check
 
