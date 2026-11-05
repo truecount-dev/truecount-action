@@ -90,6 +90,15 @@ jobs:
           TC_AGENT: ${{ matrix.agent.name }}
         # Values arrive as environment variables, never pasted into the script.
         run: python3 .truecount/src/truecount_action/runner.py token "$TC_AGENT"
+      # What the review is held to, read by Truecount from the pull request's
+      # base commit: the checkout holds the pull request's own edits.
+      - name: Fetch the review's guidelines
+        id: standard
+        env:
+          TC_API: ${{ inputs.api-url }}
+          TC_TOKEN: ${{ steps.token.outputs.token }}
+          TC_PROMPT: ${{ matrix.agent.prompt }}
+        run: python3 .truecount/src/truecount_action/runner.py standard
       - name: ${{ matrix.agent.name }}
         uses: anthropics/claude-code-action@v1
         # As the fleet's: the agent going wrong does not fail the job by itself.
@@ -102,7 +111,7 @@ jobs:
         with:
           github_token: ${{ github.token }}
           anthropic_api_key: ${{ steps.token.outputs.token }}
-          prompt: ${{ matrix.agent.prompt }}
+          prompt: ${{ steps.standard.outputs.prompt }}
           claude_args: ${{ matrix.agent.claude_args }}
       - name: Post what the agent wrote
         env:
