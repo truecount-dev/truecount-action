@@ -3,6 +3,7 @@ reusable workflow (.github/workflows/agents.yml).
 
   runner.py plan             which agents this event runs, with their definitions, as a job output
   runner.py token AGENT      a run token for one agent, masked, as a step output
+  runner.py standard         the review's guidelines, written under .truecount/standard/, and the prompt naming them
   runner.py post FILE        the agent's output file, posted by Truecount as the App
 
 The agents themselves run with Claude Code (anthropics/claude-code-action),
@@ -40,7 +41,8 @@ def plan(api: str, env: dict, out) -> int:
     pr = event.get("pull_request") or {}
     body = {"action": event.get("action"), "pull_request": {
         "number": pr.get("number"), "draft": bool(pr.get("draft")),
-        "base": {"ref": (pr.get("base") or {}).get("ref"), "sha": (pr.get("base") or {}).get("sha")}}}
+        "base": {"ref": (pr.get("base") or {}).get("ref"), "sha": (pr.get("base") or {}).get("sha")}},
+        "features": ["standard"]}  # this runner fills {standard} itself
     try:
         oidc = repro_run.oidc_token(env)
     except repro_run.Stop as stop:
@@ -75,6 +77,31 @@ def token(api: str, agent: str, env: dict, out) -> int:
     return 0
 
 
+STANDARD_DIR = ".truecount/standard/"
+
+
+def standard(api: str, env: dict, out) -> int:
+    """Write what the review is held to, as Truecount's server read it from the
+    pull request's base commit, and output the agent's prompt with the paragraph
+    that names those files. The checkout holds the pull request's own version of
+    every file, so its guidelines are not the ones that count."""
+    status, data = repro_run.request(f"{api}/api/v1/standard", {}, token=env.get("TC_TOKEN", ""), timeout=60)
+    if status != 200 or not isinstance(data.get("section"), str):
+        print(f"::error::Truecount did not send the review's guidelines: {data.get('error') or f'HTTP {status}'}", file=out)
+        return 1
+    workspace = Path(env.get("GITHUB_WORKSPACE") or ".").resolve()
+    for f in data.get("files") or []:
+        target = (workspace / f["path"]).resolve()
+        if not f["path"].startswith(STANDARD_DIR) or not target.is_relative_to(workspace / STANDARD_DIR):
+            print(f"::error::Truecount sent a file outside {STANDARD_DIR}: {f['path']}", file=out)
+            return 1
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f["text"])
+        print(f"Wrote {f['path']}", file=out)
+    output("prompt", env.get("TC_PROMPT", "").replace("{standard}", data["section"]), env)
+    return 0
+
+
 def post(api: str, file: str, env: dict, out) -> int:
     path = Path(env.get("GITHUB_WORKSPACE") or ".") / file
     if not path.is_file() or not path.read_text().strip():
@@ -99,9 +126,11 @@ def main(argv: list[str] | None = None, env: dict | None = None, out=sys.stdout)
         return plan(api, env, out)
     if argv[:1] == ["token"] and len(argv) == 2:
         return token(api, argv[1], env, out)
+    if argv == ["standard"]:
+        return standard(api, env, out)
     if argv[:1] == ["post"] and len(argv) == 2:
         return post(api, argv[1], env, out)
-    print("usage: runner.py plan | token AGENT | post FILE", file=out)
+    print("usage: runner.py plan | token AGENT | standard | post FILE", file=out)
     return 2
 
 
