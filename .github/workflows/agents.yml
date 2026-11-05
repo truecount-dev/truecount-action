@@ -11,7 +11,7 @@
 #     id-token: write   # how Truecount knows which repository and run is asking
 #   jobs:
 #     truecount:
-#       uses: truecount-dev/truecount-action/.github/workflows/agents.yml@v1
+#       uses: truecount-dev/truecount-action/.github/workflows/agents.yml@v0
 #       # with:
 #       #   runs-on: '["self-hosted", "linux"]'   # your own machines; private repositories only
 #

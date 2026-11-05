@@ -36,6 +36,20 @@ def output(name: str, value: str, env: dict) -> None:
             f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
 
 
+def no_oidc_expected(pr: dict) -> str:
+    """Why GitHub gave this pull request's workflow no OIDC token, when that is
+    GitHub's rule and not a missing `id-token: write`; blank otherwise."""
+    head = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    base = ((pr.get("base") or {}).get("repo") or {}).get("full_name")
+    if base and head != base:
+        return ("This pull request is from a fork, and GitHub gives a fork's workflow no OIDC token, so nothing runs "
+                "here. Truecount's server reviews it instead: on its own when the author is an owner, member or "
+                "collaborator, and otherwise when a maintainer comments `/truecount review`.")
+    if (pr.get("user") or {}).get("login") == "dependabot[bot]":
+        return "GitHub gave this Dependabot pull request's workflow no OIDC token, so Truecount does not review it."
+    return ""
+
+
 def plan(api: str, env: dict, out) -> int:
     event = json.loads(Path(env["GITHUB_EVENT_PATH"]).read_text()) if env.get("GITHUB_EVENT_PATH") else {}
     pr = event.get("pull_request") or {}
@@ -43,6 +57,11 @@ def plan(api: str, env: dict, out) -> int:
         "number": pr.get("number"), "draft": bool(pr.get("draft")),
         "base": {"ref": (pr.get("base") or {}).get("ref"), "sha": (pr.get("base") or {}).get("sha")}},
         "features": ["standard"]}  # this runner fills {standard} itself
+    if not env.get("ACTIONS_ID_TOKEN_REQUEST_URL") and (why := no_oidc_expected(pr)):
+        # Not a failure of the customer's job, and not one to fix in the workflow.
+        print(why, file=out)
+        output("agents", "[]", env)
+        return 0
     try:
         oidc = repro_run.oidc_token(env)
     except repro_run.Stop as stop:

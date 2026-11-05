@@ -94,3 +94,34 @@ def test_no_standard_means_no_review_rather_than_one_against_nothing(tmp_path, m
     out = io.StringIO()
     assert runner.main(["standard"], env=env(tmp_path, TC_TOKEN="t", TC_PROMPT="{standard}"), out=out) == 1
     assert "did not send the review's guidelines: bad config" in out.getvalue() and "prompt<<" not in outputs(tmp_path)
+
+
+def pr_event(tmp_path, **pr):
+    (tmp_path / "event.json").write_text(json.dumps({"action": "opened", "pull_request": {
+        "number": 7, "draft": False, "base": {"ref": "main", "sha": "b" * 40, "repo": {"full_name": "acme/widgets"}},
+        **pr}}))
+
+
+def test_a_fork_pull_request_plans_nothing_and_says_the_server_reviews_it(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(repro_run, "request", fake({}, seen))
+    no_oidc = {k: v for k, v in env(tmp_path).items() if not k.startswith("ACTIONS_ID_TOKEN")}
+    pr_event(tmp_path, head={"repo": {"full_name": "stranger/widgets"}})
+    out = io.StringIO()
+    assert runner.main(["plan"], env=no_oidc, out=out) == 0
+    assert "from a fork" in out.getvalue() and "/truecount review" in out.getvalue()
+    assert "agents<<TRUECOUNT_EOF\n[]" in outputs(tmp_path) and not seen
+
+    pr_event(tmp_path, head={"repo": None})  # the fork was deleted
+    assert runner.main(["plan"], env=no_oidc, out=io.StringIO()) == 0
+
+
+def test_dependabot_without_a_token_is_skipped_and_a_missing_permission_is_not(tmp_path, monkeypatch):
+    monkeypatch.setattr(repro_run, "request", fake({}, []))
+    no_oidc = {k: v for k, v in env(tmp_path).items() if not k.startswith("ACTIONS_ID_TOKEN")}
+    same = {"repo": {"full_name": "acme/widgets"}}
+    pr_event(tmp_path, head=same, user={"login": "dependabot[bot]"})
+    assert runner.main(["plan"], env=no_oidc, out=io.StringIO()) == 0
+    pr_event(tmp_path, head=same, user={"login": "maintainer"})
+    out = io.StringIO()
+    assert runner.main(["plan"], env=no_oidc, out=out) == 1 and "id-token: write" in out.getvalue()
